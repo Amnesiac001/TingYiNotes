@@ -1,0 +1,5 @@
+APP_NAME = "听译记"
+APP_ENGLISH_NAME = "TingYi Notes"
+APP_TAGLINE = "实时双语课堂笔记"
+APP_TITLE = f"{APP_NAME} · {APP_TAGLINE}"
+APP_BUNDLE_ID = "com.tingyiji.notes"
