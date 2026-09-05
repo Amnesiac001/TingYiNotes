@@ -86,6 +86,13 @@ COURSE_STATUS_LABELS = {
     "failed": "未完成",
 }
 
+UI_FONT_FAMILY = "PingFang SC" if IS_MACOS else "Microsoft YaHei UI"
+UI_FONT_STACK = (
+    '"PingFang SC", "SF Pro Text", "Helvetica Neue"'
+    if IS_MACOS
+    else '"Microsoft YaHei UI", "Segoe UI"'
+)
+
 
 def format_duration(milliseconds: int) -> str:
     seconds = max(0, int(milliseconds) // 1000)
@@ -95,7 +102,7 @@ def format_duration(milliseconds: int) -> str:
 
 
 STYLE = f"""
-* {{ font-family: "Microsoft YaHei UI", "Segoe UI"; color: {COLORS['text']}; }}
+* {{ font-family: {UI_FONT_STACK}; color: {COLORS['text']}; }}
 QMainWindow, QWidget#Root {{ background: {COLORS['bg']}; }}
 QFrame#Sidebar {{ background: {COLORS['surface']}; border-right: 1px solid {COLORS['border']}; }}
 QFrame#Topbar {{ background: {COLORS['surface']}; border-bottom: 1px solid {COLORS['border']}; }}
@@ -123,6 +130,7 @@ QFrame#WorkspacePane {{ background: {COLORS['surface']}; border: none; }}
 QFrame#ContextPane {{ background: {COLORS['surface_alt']}; border: none; border-right: 1px solid {COLORS['border']}; }}
 QFrame#AssistantPane {{ background: {COLORS['surface_alt']}; border: none; border-left: 1px solid {COLORS['border']}; }}
 QFrame#NowSpeaking {{ background: #F8FAFC; border: none; border-left: 3px solid {COLORS['primary']}; }}
+QFrame#RecentReview {{ background: {COLORS['surface_alt']}; border: 1px solid {COLORS['border']}; border-radius: 5px; }}
 QFrame#QualityStrip {{ background: {COLORS['surface']}; border: none; border-bottom: 1px solid {COLORS['border']}; }}
 QFrame#ControlBar {{ background: {COLORS['surface']}; border: none; border-top: 1px solid {COLORS['border']}; }}
 QLabel#QualityLabel {{ color: {COLORS['muted']}; font-size: 12px; }}
@@ -430,10 +438,18 @@ class ParagraphCard(QFrame):
         self.copy_button = QPushButton("复制")
         self.copy_button.setToolTip("复制本段英文和中文")
         self.copy_button.clicked.connect(self.copy_text)
+        self.english_button = QPushButton("显示英文")
+        self.english_button.setToolTip("显示或隐藏本段英文原文")
+        self.english_button.clicked.connect(self.toggle_english)
         self.detail_button = QPushButton("展开逐句")
         self.detail_button.setToolTip("查看本段中每句话的时间和翻译")
         self.detail_button.clicked.connect(self.toggle_details)
-        for button in (self.retry_button, self.copy_button, self.detail_button):
+        for button in (
+            self.retry_button,
+            self.copy_button,
+            self.english_button,
+            self.detail_button,
+        ):
             button.setStyleSheet(
                 f"QPushButton{{border:none;background:transparent;color:{COLORS['muted']};"
                 "padding:2px 5px;font-size:11px;}"
@@ -444,6 +460,7 @@ class ParagraphCard(QFrame):
         heading.addStretch()
         heading.addWidget(self.retry_button)
         heading.addWidget(self.copy_button)
+        heading.addWidget(self.english_button)
         heading.addWidget(self.detail_button)
         self.english = QLabel()
         self.english.setWordWrap(True)
@@ -462,9 +479,10 @@ class ParagraphCard(QFrame):
         )
         self.details.hide()
         layout.addLayout(heading)
-        layout.addWidget(self.english)
         layout.addWidget(self.chinese)
+        layout.addWidget(self.english)
         layout.addWidget(self.details)
+        self.english.hide()
         self.render()
 
     def add_segment(self, segment: Segment) -> None:
@@ -536,6 +554,11 @@ class ParagraphCard(QFrame):
         self.details.setVisible(visible)
         self.detail_button.setText("收起逐句" if visible else "展开逐句")
 
+    def toggle_english(self) -> None:
+        visible = self.english.isHidden()
+        self.english.setVisible(visible)
+        self.english_button.setText("隐藏英文" if visible else "显示英文")
+
     def marker_for(self, segment_id: str) -> str:
         for segment in self.segments:
             if segment.id == segment_id:
@@ -570,6 +593,83 @@ class ParagraphCard(QFrame):
     def _time(milliseconds: int) -> str:
         seconds = max(0, milliseconds // 1000)
         return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+class RecentReviewPane(QFrame):
+    """Compactly show what the lecturer covered during the last two minutes."""
+
+    WINDOW_MS = 120_000
+    MAX_SEGMENTS = 12
+    MAX_CHARS = 680
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.topic = ""
+        self.segments: list[Segment] = []
+        self.setObjectName("RecentReview")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 11, 15, 13)
+        layout.setSpacing(6)
+        heading = QHBoxLayout()
+        heading.setSpacing(8)
+        self.title = QLabel("最近几分钟")
+        self.title.setStyleSheet("font-size:13px;font-weight:650;")
+        self.meta = QLabel("等待稳定中文")
+        self.meta.setStyleSheet(f"font-size:11px;color:{COLORS['muted']};")
+        heading.addWidget(self.title)
+        heading.addStretch()
+        heading.addWidget(self.meta)
+        self.body = QLabel("翻译完成后，这里会把老师刚讲的内容合并成一段，方便快速跟上课堂。")
+        self.body.setWordWrap(True)
+        self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.body.setStyleSheet(f"font-size:15px;line-height:1.65;color:{COLORS['text']};")
+        layout.addLayout(heading)
+        layout.addWidget(self.body)
+
+    def set_topic(self, topic: str) -> None:
+        self.topic = " ".join(topic.strip().split())
+        self._render()
+
+    def set_segments(self, segments: list[Segment]) -> None:
+        self.segments = segments
+        self._render()
+
+    def reset(self) -> None:
+        self.topic = ""
+        self.segments = []
+        self._render()
+
+    def _recent_segments(self) -> list[Segment]:
+        translated = [item for item in self.segments if item.translated_text.strip()]
+        if not translated:
+            return []
+        latest_end = max(item.end_ms for item in translated)
+        candidates = [
+            item
+            for item in translated
+            if item.end_ms >= max(0, latest_end - self.WINDOW_MS)
+        ][-self.MAX_SEGMENTS :]
+        selected: list[Segment] = []
+        characters = 0
+        for item in reversed(candidates):
+            length = len(item.translated_text.strip())
+            if selected and characters + length > self.MAX_CHARS:
+                break
+            selected.append(item)
+            characters += length
+        return list(reversed(selected))
+
+    def _render(self) -> None:
+        recent = self._recent_segments()
+        self.title.setText(self.topic or "最近几分钟")
+        if not recent:
+            self.meta.setText("等待稳定中文")
+            self.body.setText("翻译完成后，这里会把老师刚讲的内容合并成一段，方便快速跟上课堂。")
+            return
+        start = ParagraphCard._time(recent[0].start_ms)
+        end = ParagraphCard._time(recent[-1].end_ms)
+        self.meta.setText(f"{start}–{end} · {len(recent)} 句")
+        self.body.setText(" ".join(item.translated_text.strip() for item in recent))
 
 
 class MaterialsPane(QFrame):
@@ -950,14 +1050,14 @@ class LivePage(Page):
         now_layout = QVBoxLayout(self.now_speaking)
         now_layout.setContentsMargins(16, 12, 16, 14)
         now_layout.setSpacing(6)
-        english_head = QLabel("当前英文")
+        english_head = QLabel("老师正在讲 · 英文")
         english_head.setStyleSheet(f"color:{COLORS['muted']};font-size:12px;font-weight:600;")
         self.partial = QLabel("等待英文语音……")
         self.partial.setWordWrap(True)
         self.partial.setObjectName("LiveEnglish")
         self.partial.setMinimumHeight(42)
         self.partial.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        chinese_head = QLabel("实时翻译")
+        chinese_head = QLabel("中文")
         chinese_head.setStyleSheet(f"color:{COLORS['muted']};font-size:11px;font-weight:650;")
         self.current_translation = QLabel("翻译会显示在这里。")
         self.current_translation.setWordWrap(True)
@@ -968,8 +1068,9 @@ class LivePage(Page):
         now_layout.addWidget(self.partial)
         now_layout.addWidget(chinese_head)
         now_layout.addWidget(self.current_translation)
+        self.recent_review = RecentReviewPane()
         history_row = QHBoxLayout()
-        history_head = QLabel("课堂逐字稿")
+        history_head = QLabel("课堂记录 · 按段落整理")
         history_head.setObjectName("PaneTitle")
         self.new_items_button = QPushButton("回到最新")
         self.new_items_button.setToolTip("你正在阅读较早内容；点击回到最新字幕")
@@ -1003,9 +1104,9 @@ class LivePage(Page):
             f"background:{COLORS['primary_soft']}; color:{COLORS['primary']}; "
             "border-radius:10px; font-weight:700;"
         )
-        empty_title = QLabel("课堂字幕会出现在这里")
+        empty_title = QLabel("完整课堂记录会保存在这里")
         empty_title.setStyleSheet("font-size:16px; font-weight:650;")
-        empty_hint = QLabel("点击“开始课堂”后，英文原文和中文翻译会按时间依次记录。")
+        empty_hint = QLabel("中文按段落合并显示；需要核对时再展开英文原文和逐句记录。")
         empty_hint.setObjectName("Muted")
         empty_layout.addWidget(empty_icon, 0, Qt.AlignmentFlag.AlignCenter)
         empty_layout.addSpacing(5)
@@ -1016,6 +1117,7 @@ class LivePage(Page):
         self.cards_layout.addStretch()
         scroll.setWidget(self.cards_host)
         center_layout.addWidget(self.now_speaking)
+        center_layout.addWidget(self.recent_review)
         center_layout.addLayout(history_row)
         center_layout.addWidget(scroll, 1)
 
@@ -1450,6 +1552,7 @@ class LivePage(Page):
         elif name == "summary_update":
             if isinstance(payload, LiveSummarySnapshot):
                 self.summary.apply_snapshot(payload)
+                self.recent_review.set_topic(payload.topic)
         elif name == "summary_status":
             self.summary.set_status(payload)
         elif name == "capture_started":
@@ -1543,6 +1646,9 @@ class LivePage(Page):
         self.transcript_cards[segment.id] = card
         self.saved_segment_count += 1
         self.save_quality.setText(f"已保存 {self.saved_segment_count} 句")
+        self.recent_review.set_segments(
+            [item for paragraph in self.paragraph_cards for item in paragraph.segments]
+        )
         self._schedule_transcript_follow()
 
     def toggle_latest_marker(self, marker: str) -> None:
@@ -1595,6 +1701,10 @@ class LivePage(Page):
             card.update_translation(segment_id, text, final=final)
         if text and segment_id == self.latest_segment_id:
             self.current_translation.setText(text)
+        if final:
+            self.recent_review.set_segments(
+                [item for paragraph in self.paragraph_cards for item in paragraph.segments]
+            )
 
     def _schedule_transcript_follow(self) -> None:
         if self.auto_follow:
@@ -1647,6 +1757,7 @@ class LivePage(Page):
         self.empty_state.show()
         self.partial.setText("等待英文语音……")
         self.current_translation.setText("翻译会显示在这里。")
+        self.recent_review.reset()
         self.summary.reset()
         self.update_course_context_preview()
 
@@ -2558,7 +2669,7 @@ def main() -> None:
         app.setWindowIcon(QIcon(str(icon_path)))
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
-    font = QFont("Microsoft YaHei UI", 10)
+    font = QFont(UI_FONT_FAMILY, 10)
     app.setFont(font)
     settings = Settings.load()
     settings.ensure_directories()

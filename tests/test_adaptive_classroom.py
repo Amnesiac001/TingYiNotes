@@ -136,6 +136,8 @@ def test_live_translation_never_replaces_current_text_with_an_older_sentence() -
     assert live.current_translation.text() == "正在翻译……"
     live.update_translation(latest.id, "最新句子的译文")
     assert live.current_translation.text() == "最新句子的译文"
+    assert "最新句子的译文" in live.recent_review.body.text()
+    assert "较早句子的译文" in live.recent_review.body.text()
     window.close()
     application.processEvents()
 
