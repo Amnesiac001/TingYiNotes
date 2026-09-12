@@ -432,6 +432,9 @@ class ParagraphCard(QFrame):
         self.failed_ids: set[str] = set()
         self.reading_mode = "chinese"
         self.setObjectName("Transcript")
+        self.review_highlight_timer = QTimer(self)
+        self.review_highlight_timer.setSingleShot(True)
+        self.review_highlight_timer.timeout.connect(self.clear_review_highlight)
         layout = QVBoxLayout(self)
         self.body_layout = layout
         layout.setContentsMargins(4, 12, 8, 15)
@@ -632,6 +635,17 @@ class ParagraphCard(QFrame):
         anchor = self.segments[-1]
         updated = "" if anchor.marker == marker else marker
         self.marker_requested.emit(anchor.id, updated)
+
+    def highlight_for_review(self) -> None:
+        self.setStyleSheet(
+            f"QFrame#Transcript{{background:{COLORS['primary_soft']};"
+            f"border:none;border-left:3px solid {COLORS['primary']};"
+            f"border-bottom:1px solid {COLORS['border']};}}"
+        )
+        self.review_highlight_timer.start(2500)
+
+    def clear_review_highlight(self) -> None:
+        self.setStyleSheet("")
 
     def set_retrying(self, segment_id: str) -> None:
         self.failed_ids.discard(segment_id)
@@ -1358,13 +1372,13 @@ class LivePage(Page):
         history_row = QHBoxLayout()
         history_head = QLabel("课堂记录 · 按段落整理")
         history_head.setObjectName("PaneTitle")
-        self.new_items_button = QPushButton("回到最新")
-        self.new_items_button.setToolTip("你正在阅读较早内容；点击回到最新字幕")
+        self.new_items_button = QPushButton("回到实时")
+        self.new_items_button.setToolTip("你正在阅读较早内容；点击返回最新字幕")
         self.new_items_button.setStyleSheet(
             f"QPushButton{{color:{COLORS['primary']};background:{COLORS['primary_soft']};"
             "border:0;border-radius:7px;padding:5px 10px;font-size:12px;}"
         )
-        self.new_items_button.clicked.connect(self._scroll_to_latest)
+        self.new_items_button.clicked.connect(self._return_to_live)
         self.new_items_button.hide()
         history_row.addWidget(history_head)
         history_row.addStretch()
@@ -1595,19 +1609,23 @@ class LivePage(Page):
             (card for card in self.paragraph_cards if card.segments[-1].end_ms >= start_ms),
             self.paragraph_cards[-1],
         )
-        self.auto_follow = False
-        self.scroll.ensureWidgetVisible(target, 0, 8)
+        self._jump_to_card(target)
 
     def jump_to_segment(self, segment_id: str) -> None:
         target = self.transcript_cards.get(segment_id)
         if target is None:
             return
+        self._jump_to_card(target)
+
+    def _jump_to_card(self, target: ParagraphCard) -> None:
         if not self.quick_review.isHidden():
             self.quick_review.hide()
             self.recent_review.show()
             self.review_button.setText("回顾刚才")
         self.scroll.ensureWidgetVisible(target, 0, 8)
         self.auto_follow = False
+        self._show_return_to_live()
+        target.highlight_for_review()
 
     def toggle_quick_review(self) -> None:
         if self.quick_review.isHidden():
@@ -2131,10 +2149,20 @@ class LivePage(Page):
 
     def _schedule_transcript_follow(self) -> None:
         if self.auto_follow:
-            QTimer.singleShot(50, self._scroll_to_latest)
+            QTimer.singleShot(50, self._follow_latest_if_enabled)
             return
         self.unseen_segments += 1
-        self.new_items_button.setText(f"回到最新 · {self.unseen_segments}")
+        self._show_return_to_live()
+
+    def _follow_latest_if_enabled(self) -> None:
+        if self.auto_follow:
+            self._scroll_to_latest()
+
+    def _show_return_to_live(self) -> None:
+        label = "回到实时"
+        if self.unseen_segments:
+            label += f" · {self.unseen_segments} 条新字幕"
+        self.new_items_button.setText(label)
         self.new_items_button.show()
 
     def _on_transcript_scroll(self, value: int) -> None:
@@ -2148,6 +2176,7 @@ class LivePage(Page):
             self.new_items_button.hide()
         else:
             self.auto_follow = False
+            self._show_return_to_live()
 
     def _scroll_to_latest(self) -> None:
         bar = self.scroll.verticalScrollBar()
@@ -2158,7 +2187,7 @@ class LivePage(Page):
             self._programmatic_scroll = False
         self.auto_follow = True
         self.unseen_segments = 0
-        self.new_items_button.setText("回到最新")
+        self.new_items_button.setText("回到实时")
         self.new_items_button.hide()
 
     def clear_session_content(self) -> None:
@@ -2175,7 +2204,7 @@ class LivePage(Page):
         self.saved_segment_count = 0
         self.save_quality.setText("已保存 0 句")
         self._sync_marker_controls("")
-        self.new_items_button.setText("回到最新")
+        self.new_items_button.setText("回到实时")
         self.new_items_button.hide()
         for index in range(self.cards_layout.count() - 1, -1, -1):
             widget = self.cards_layout.itemAt(index).widget()

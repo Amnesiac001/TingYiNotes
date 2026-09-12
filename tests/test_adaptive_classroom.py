@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from classnote.config import Settings
@@ -128,6 +129,9 @@ def test_live_timeline_switches_with_materials_and_jumps_without_autofollow() ->
     assert live.timeline.entries == [(0, "慢启动")]
     live.jump_to_topic(0)
     assert not live.auto_follow
+    assert not live.new_items_button.isHidden()
+    assert "回到实时" in live.new_items_button.text()
+    assert live.transcript_cards[first.id].review_highlight_timer.isActive()
     live.clear_session_content()
     assert live.timeline.entries == []
     live.session = None
@@ -294,6 +298,65 @@ def test_new_subtitles_do_not_steal_scroll_when_user_reads_older_content() -> No
     assert live.unseen_segments == 0
     assert live.new_items_button.isHidden()
     window.close()
+
+
+def test_pending_auto_follow_does_not_cancel_a_review_jump() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    old = Segment("Earlier sentence.", "之前的句子。", 0, 1000)
+    later = Segment("New sentence.", "新句子。", 5000, 6000)
+
+    live.add_segment(old)
+    live.add_segment(later)
+    live.jump_to_segment(old.id)
+    QTest.qWait(80)
+
+    assert not live.auto_follow
+    assert not live.new_items_button.isHidden()
+    assert live.transcript_cards[old.id].review_highlight_timer.isActive()
+    live._scroll_to_latest()
+    assert live.auto_follow
+    assert live.new_items_button.isHidden()
+    window.close()
+    application.processEvents()
+
+
+def test_scrolling_away_from_latest_immediately_offers_a_return_button() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    bar = live.scroll.verticalScrollBar()
+    bar.setRange(0, 100)
+
+    live._on_transcript_scroll(0)
+    assert not live.auto_follow
+    assert not live.new_items_button.isHidden()
+    assert live.new_items_button.text() == "回到实时"
+
+    live._on_transcript_scroll(100)
+    assert live.auto_follow
+    assert live.new_items_button.isHidden()
+    window.close()
+    application.processEvents()
+
+
+def test_return_button_closes_quick_review_as_well_as_restoring_follow() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    live.add_segment(Segment("Earlier.", "之前。", 0, 1000))
+    live.toggle_quick_review()
+    live.auto_follow = False
+    live._show_return_to_live()
+
+    live.new_items_button.click()
+
+    assert live.quick_review.isHidden()
+    assert live.auto_follow
+    assert live.new_items_button.isHidden()
+    window.close()
+    application.processEvents()
 
 
 def test_latest_translation_failure_is_visible_without_overwriting_older_state() -> None:
