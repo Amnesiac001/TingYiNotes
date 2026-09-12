@@ -49,6 +49,7 @@ from .config import Settings, save_env_settings
 from .courseware import CourseContext, build_course_context
 from .live import AudioDevice, AudioLevelResult, LiveCourseSession, capture_audio_level, list_input_devices
 from .live_summary import LiveSummarySnapshot
+from .marked_context import MarkedContext, build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult, Segment
 from .paragraphs import group_segments, should_start_new_paragraph
 from .platforms import (
@@ -993,6 +994,7 @@ class SummaryPane(QFrame):
         body.setSpacing(18)
         self.overview = self._add_section(body, "当前主题")
         self.points_view = self._add_section(body, "关键要点")
+        self.markers = self._add_section(body, "手动重点与疑问")
         self.terms = self._add_section(body, "术语")
         self.questions = self._add_section(body, "待复习")
         body.addStretch()
@@ -1055,6 +1057,26 @@ class SummaryPane(QFrame):
         self.reference_terms = values
         self._render_terms()
 
+    def set_marked_contexts(self, contexts: list[MarkedContext]) -> None:
+        if not contexts:
+            self.markers.setText(
+                "<p style='color:#777;line-height:1.6'>按 Ctrl+1 标重点、Ctrl+2 标疑问；这里会保留前后约 20 秒语境。</p>"
+            )
+            return
+        entries = []
+        for context in contexts[-4:][::-1]:
+            content = (context.chinese or context.english).strip()
+            if context.chinese and context.pending_english:
+                content += f"  ·  {context.pending_english}（待翻译）"
+            if len(content) > 220:
+                content = content[:219].rstrip() + "…"
+            entries.append(
+                f"<p style='margin-bottom:12px;line-height:1.55'><b>{html.escape(context.label)}</b>"
+                f" · {format_duration(context.start_ms)}–{format_duration(context.end_ms)}<br>"
+                f"{html.escape(content)}</p>"
+            )
+        self.markers.setText("".join(entries))
+
     def _render_terms(self) -> None:
         merged: list[str] = []
         for value in [*self.reference_terms, *self.snapshot.terms]:
@@ -1091,6 +1113,7 @@ class SummaryPane(QFrame):
         self.points_view.setText(
             "<p style='color:#777;line-height:1.6'>每积累几句字幕，后台更新一次关键要点。</p>"
         )
+        self.set_marked_contexts([])
         self._render_terms()
         self.questions.setText(
             "<p style='color:#777;line-height:1.6'>摘要会提取尚待解释或值得复习的问题。</p>"
@@ -1977,6 +2000,7 @@ class LivePage(Page):
         self.save_quality.setText(f"已保存 {self.saved_segment_count} 句")
         segments = self._all_live_segments()
         self.recent_review.set_segments(segments)
+        self.summary.set_marked_contexts(build_marked_contexts(segments))
         if not self.quick_review.isHidden():
             self.quick_review.set_segments(segments)
         self._schedule_transcript_follow()
@@ -1997,6 +2021,9 @@ class LivePage(Page):
             setter(self.latest_segment_id, updated)
             card.set_marker(self.latest_segment_id, updated)
             self._sync_marker_controls(updated)
+            self.summary.set_marked_contexts(
+                build_marked_contexts(self._all_live_segments())
+            )
         except Exception as exc:
             self.notice.show_notice(f"标记没有保存：{friendly_error(exc)}", error=True)
 
@@ -2034,6 +2061,7 @@ class LivePage(Page):
         if final:
             segments = self._all_live_segments()
             self.recent_review.set_segments(segments)
+            self.summary.set_marked_contexts(build_marked_contexts(segments))
             if not self.quick_review.isHidden():
                 self.quick_review.set_segments(segments)
 
@@ -2482,12 +2510,16 @@ class LibraryPage(Page):
                 block += f"\n\n**中文**\n\n{translated}"
             transcript.append(block)
         notes_section = notes or "> 这节课尚未生成整理笔记，已保存的逐字稿仍可在下方查看。"
+        marked_section = marked_contexts_markdown(build_marked_contexts(segments))
+        if marked_section:
+            marked_section = f"---\n\n{marked_section}\n\n"
         transcript_section = "\n\n---\n\n".join(transcript) or "> 没有保存到有效字幕。这通常表示课堂在音频设备或模型启动阶段就已停止。"
         self.preview.setMarkdown(
             f"# {row['title']}\n\n"
             f"{row['subject']} · {lifecycle}{issue}\n\n"
             f"---\n\n## 课堂脉络\n\n{topics_section}\n\n"
             f"---\n\n## 整理笔记\n\n{notes_section}\n\n"
+            f"{marked_section}"
             f"---\n\n## 英中对照逐字稿\n\n{transcript_section}"
         )
 

@@ -389,10 +389,19 @@ def test_latest_sentence_marker_is_persisted_and_can_be_toggled() -> None:
     assert segment.marker == "important"
     assert "重点" in live.transcript_cards[segment.id].marker_badge.text()
     assert live.important_button.text() == "★ 已标重点"
+    assert "这很重要。" in live.summary.markers.text()
 
+    following = Segment("A supporting point.", "", 2000, 3000)
+    live.add_segment(following, pending=True)
+    assert "A supporting point." in live.summary.markers.text()
+    live.update_translation(following.id, "补充说明。")
+    assert "补充说明。" in live.summary.markers.text()
+
+    live.latest_segment_id = segment.id
     live.toggle_latest_marker("important")
     assert calls[-1] == (segment.id, "")
     assert segment.marker == ""
+    assert "这很重要。" not in live.summary.markers.text()
     live.session = None
     window.close()
     application.processEvents()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .marked_context import build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult
 from .paragraphs import group_segments
 
@@ -36,8 +37,12 @@ def export_markdown(result: CourseResult, export_dir: Path) -> Path:
             block += f"\n\n**中文**\n\n{chinese}"
         blocks.append(block)
     transcript = "\n\n---\n\n".join(blocks)
+    marked_section = marked_contexts_markdown(build_marked_contexts(result.segments))
+    if marked_section:
+        marked_section = f"{marked_section}\n\n---\n\n"
     content = (
         f"{result.notes_markdown.rstrip()}\n\n---\n\n"
+        f"{marked_section}"
         f"## 英中对照记录\n\n{transcript}\n"
     )
     path.write_text(content, encoding="utf-8")

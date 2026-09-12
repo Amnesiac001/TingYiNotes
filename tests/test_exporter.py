@@ -63,4 +63,6 @@ def test_export_preserves_manual_important_and_question_markers(tmp_path: Path) 
 
     assert "⭐ 重点" in content
     assert "❓ 疑问" in content
+    assert "## 课堂手动标记与前后语境" in content
+    assert "Important. Why?" in content
     assert "[课堂手动标记" not in content
