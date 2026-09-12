@@ -5,14 +5,14 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from classnote.config import Settings
 from classnote.models import Segment
-from classnote.qt_gui import MainWindow, MaterialsPane, SettingsPage, TopicTimelinePane
+from classnote.qt_gui import MainWindow, MaterialsPane, ParagraphCard, SettingsPage, TopicTimelinePane
 from classnote.live_summary import LiveSummarySnapshot
 from classnote.models import CourseResult
 from classnote.storage import CourseRepository
@@ -290,6 +290,7 @@ def test_new_subtitles_do_not_steal_scroll_when_user_reads_older_content() -> No
     live.add_segment(Segment("A new sentence", "新句子", 0, 1000))
     application.processEvents()
 
+    assert len(live.paragraph_cards) == 1
     assert live.unseen_segments == 1
     assert not live.new_items_button.isHidden()
     assert "1" in live.new_items_button.text()
@@ -507,6 +508,116 @@ def test_old_paragraph_can_be_marked_and_reopened_from_summary() -> None:
     assert calls[-1] == (old.id, "")
     assert "segment:" + old.id not in live.summary.markers.text()
     live.session = None
+    window.close()
+    application.processEvents()
+
+
+def test_long_classroom_keeps_only_a_window_of_cards_without_losing_old_content() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    live.VISIBLE_PARAGRAPHS = 3
+    live.PAGE_PARAGRAPHS = 2
+    calls: list[tuple[str, str]] = []
+
+    class Session:
+        def set_segment_marker(self, segment_id: str, marker: str) -> None:
+            calls.append((segment_id, marker))
+
+    live.session = Session()
+    segments = [
+        Segment(f"Sentence {index}.", f"句子 {index}。", index * 5000, index * 5000 + 1000)
+        for index in range(8)
+    ]
+    for segment in segments:
+        live.add_segment(segment)
+    application.processEvents()
+
+    assert len(live.paragraph_cards) == 3
+    assert live.visible_start == 5
+    assert len(live._all_live_segments()) == 8
+    assert segments[0].id not in live.transcript_cards
+    assert "第 6–8 / 8 段" in live.history_head.text()
+    assert not live.older_button.isHidden()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert len(window.findChildren(ParagraphCard)) == 3
+
+    live.show_older_paragraphs()
+    assert live.visible_start == 3
+    assert not live.newer_button.isHidden()
+    live.show_newer_paragraphs()
+    assert live.visible_start == 5
+
+    live.update_translation(segments[0].id, "迟到的中文。")
+    live.handle_event("translation_failed", (segments[1].id, "timeout"))
+    live.jump_to_topic(0)
+    old_card = live.transcript_cards[segments[0].id]
+    assert old_card.chinese.text() == "迟到的中文。"
+    assert live.visible_start == 0
+    assert not live.newer_button.isHidden()
+    assert not live.transcript_cards[segments[1].id].retry_button.isHidden()
+    old_card.important_action.trigger()
+    assert calls == [(segments[0].id, "important")]
+
+    live.toggle_latest_marker("question")
+    assert calls[-1] == (segments[-1].id, "question")
+
+    newcomer = Segment("New live sentence.", "新句。", 50_000, 51_000)
+    live.add_segment(newcomer)
+    assert newcomer.id not in live.transcript_cards
+    assert live.unseen_segments == 1
+    live._scroll_to_latest()
+    assert newcomer.id in live.transcript_cards
+    assert len(live.paragraph_cards) == 3
+    assert live.auto_follow
+    live.summary._marker_link_activated("segment:" + segments[0].id)
+    assert segments[0].id in live.transcript_cards
+    assert not live.auto_follow
+    live._scroll_to_latest()
+    next_segment = Segment("Still live.", "仍在继续。", 55_000, 56_000)
+    live.add_segment(next_segment)
+    assert next_segment.id in live.transcript_cards
+    assert len(live.paragraph_cards) == 3
+    live.clear_session_content()
+    assert live.paragraph_groups == []
+    assert live.transcript_cards == {}
+    live.session = None
+    window.close()
+    application.processEvents()
+
+
+def test_jump_refreshes_a_visible_paragraph_that_grew_during_review() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    first = Segment("First.", "第一句。", 0, 1000)
+    second = Segment("Second.", "第二句。", 1100, 2000)
+    live.add_segment(first)
+    live.auto_follow = False
+    live.add_segment(second)
+    assert second.id not in live.transcript_cards
+
+    live.jump_to_segment(second.id)
+
+    assert second.id in live.transcript_cards
+    assert "第二句" in live.transcript_cards[second.id].chinese.text()
+    assert live.transcript_cards[second.id].review_highlight_timer.isActive()
+    window.close()
+    application.processEvents()
+
+
+def test_finishing_classroom_releases_live_paragraph_window() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    live.add_segment(Segment("Saved.", "已保存。", 0, 1000))
+    assert live.paragraph_groups
+
+    live.reset()
+
+    assert live.paragraph_groups == []
+    assert live.transcript_cards == {}
+    assert live.live_segments == []
     window.close()
     application.processEvents()
 

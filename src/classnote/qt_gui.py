@@ -1182,6 +1182,9 @@ class SummaryPane(QFrame):
 
 
 class LivePage(Page):
+    VISIBLE_PARAGRAPHS = 160
+    PAGE_PARAGRAPHS = 100
+
     def __init__(
         self,
         bridge: Bridge,
@@ -1197,6 +1200,12 @@ class LivePage(Page):
         self.session: object | None = None
         self.transcript_cards: dict[str, ParagraphCard] = {}
         self.paragraph_cards: list[ParagraphCard] = []
+        self.paragraph_groups: list[list[Segment]] = []
+        self.group_by_segment: dict[str, int] = {}
+        self.segments_by_id: dict[str, Segment] = {}
+        self.failed_segment_ids: set[str] = set()
+        self.visible_start = 0
+        self._view_dirty = False
         self.live_segments: list[Segment] = []
         self.latest_segment_id = ""
         self.auto_follow = True
@@ -1377,8 +1386,22 @@ class LivePage(Page):
         self.quick_review.jump_requested.connect(self.jump_from_quick_review)
         self.quick_review.hide()
         history_row = QHBoxLayout()
-        history_head = QLabel("课堂记录 · 按段落整理")
-        history_head.setObjectName("PaneTitle")
+        self.history_head = QLabel("课堂记录 · 按段落整理")
+        self.history_head.setObjectName("PaneTitle")
+        self.older_button = QPushButton("更早")
+        self.older_button.setToolTip("加载前一页课堂段落；录音仍会继续")
+        self.older_button.clicked.connect(self.show_older_paragraphs)
+        self.older_button.hide()
+        self.newer_button = QPushButton("较新")
+        self.newer_button.setToolTip("加载后一页课堂段落")
+        self.newer_button.clicked.connect(self.show_newer_paragraphs)
+        self.newer_button.hide()
+        for button in (self.older_button, self.newer_button):
+            button.setStyleSheet(
+                f"QPushButton{{border:none;background:transparent;color:{COLORS['muted']};"
+                "padding:4px 7px;font-size:11px;}"
+                f"QPushButton:hover{{color:{COLORS['primary']};background:{COLORS['primary_soft']};}}"
+            )
         self.new_items_button = QPushButton("回到实时")
         self.new_items_button.setToolTip("你正在阅读较早内容；点击返回最新字幕")
         self.new_items_button.setStyleSheet(
@@ -1387,8 +1410,10 @@ class LivePage(Page):
         )
         self.new_items_button.clicked.connect(self._return_to_live)
         self.new_items_button.hide()
-        history_row.addWidget(history_head)
+        history_row.addWidget(self.history_head)
         history_row.addStretch()
+        history_row.addWidget(self.older_button)
+        history_row.addWidget(self.newer_button)
         history_row.addWidget(self.new_items_button)
 
         scroll = QScrollArea()
@@ -1610,18 +1635,29 @@ class LivePage(Page):
             self.workspace.setSizes([0, 0, max(560, total - summary_width), summary_width])
 
     def jump_to_topic(self, start_ms: int) -> None:
-        if not self.paragraph_cards:
+        if not self.paragraph_groups:
             return
-        target = next(
-            (card for card in self.paragraph_cards if card.segments[-1].end_ms >= start_ms),
-            self.paragraph_cards[-1],
+        index = next(
+            (index for index, group in enumerate(self.paragraph_groups)
+             if group[-1].end_ms >= start_ms),
+            len(self.paragraph_groups) - 1,
         )
-        self._jump_to_card(target)
+        self._jump_to_group(index)
 
     def jump_to_segment(self, segment_id: str) -> None:
-        target = self.transcript_cards.get(segment_id)
-        if target is None:
+        index = self.group_by_segment.get(segment_id)
+        if index is None:
             return
+        self._jump_to_group(index)
+
+    def _jump_to_group(self, index: int) -> None:
+        if self._view_dirty or not (self.visible_start <= index < self._visible_end()):
+            start = (
+                self.visible_start if self.visible_start <= index < self._visible_end()
+                else index - self.VISIBLE_PARAGRAPHS // 2
+            )
+            self._render_paragraph_window(start)
+        target = self.paragraph_cards[index - self.visible_start]
         self._jump_to_card(target)
 
     def _jump_to_card(self, target: ParagraphCard) -> None:
@@ -1633,6 +1669,85 @@ class LivePage(Page):
         self.auto_follow = False
         self._show_return_to_live()
         target.highlight_for_review()
+
+    def _visible_end(self) -> int:
+        return self.visible_start + len(self.paragraph_cards)
+
+    def _create_paragraph_card(self, group: list[Segment]) -> ParagraphCard:
+        card = ParagraphCard(group[0])
+        for segment in group[1:]:
+            card.add_segment(segment)
+        card.failed_ids = {
+            segment.id for segment in group if segment.id in self.failed_segment_ids
+        }
+        if card.failed_ids:
+            card.render()
+        card.set_reading_mode(self.reading_mode)
+        card.retry_requested.connect(self.retry_translation)
+        card.marker_requested.connect(self.set_segment_marker)
+        for segment in group:
+            self.transcript_cards[segment.id] = card
+        return card
+
+    def _remove_paragraph_card(self, card: ParagraphCard) -> None:
+        for segment in card.segments:
+            self.transcript_cards.pop(segment.id, None)
+        self.cards_layout.removeWidget(card)
+        card.deleteLater()
+
+    def _render_paragraph_window(self, start: int) -> None:
+        total = len(self.paragraph_groups)
+        start = max(0, min(start, max(0, total - self.VISIBLE_PARAGRAPHS)))
+        self._programmatic_scroll = True
+        try:
+            for card in self.paragraph_cards:
+                self._remove_paragraph_card(card)
+            self.paragraph_cards = []
+            self.visible_start = start
+            for group in self.paragraph_groups[start:start + self.VISIBLE_PARAGRAPHS]:
+                card = self._create_paragraph_card(group)
+                self.paragraph_cards.append(card)
+                self.cards_layout.insertWidget(max(0, self.cards_layout.count() - 1), card)
+            self.empty_state.setVisible(not total)
+            self._view_dirty = False
+        finally:
+            self._programmatic_scroll = False
+        self._update_history_navigation()
+
+    def _update_history_navigation(self) -> None:
+        total = len(self.paragraph_groups)
+        if total:
+            self.history_head.setText(
+                f"课堂记录 · 第 {self.visible_start + 1}–{self._visible_end()} / {total} 段"
+            )
+        else:
+            self.history_head.setText("课堂记录 · 按段落整理")
+        self.older_button.setVisible(self.visible_start > 0)
+        self.newer_button.setVisible(self._visible_end() < total)
+
+    def show_older_paragraphs(self) -> None:
+        if self.visible_start <= 0:
+            return
+        self.auto_follow = False
+        self._render_paragraph_window(self.visible_start - self.PAGE_PARAGRAPHS)
+        self._programmatic_scroll = True
+        try:
+            self.scroll.verticalScrollBar().setValue(0)
+        finally:
+            self._programmatic_scroll = False
+        self._show_return_to_live()
+
+    def show_newer_paragraphs(self) -> None:
+        if self._visible_end() >= len(self.paragraph_groups):
+            return
+        self.auto_follow = False
+        self._render_paragraph_window(self.visible_start + self.PAGE_PARAGRAPHS)
+        self._programmatic_scroll = True
+        try:
+            self.scroll.verticalScrollBar().setValue(0)
+        finally:
+            self._programmatic_scroll = False
+        self._show_return_to_live()
 
     def toggle_quick_review(self) -> None:
         if self.quick_review.isHidden():
@@ -1967,10 +2082,10 @@ class LivePage(Page):
                 self.summary.apply_snapshot(payload)
                 self.recent_review.set_topic(payload.topic)
                 self.quick_review.set_topic(payload.topic)
-                if payload.topic and self.paragraph_cards:
-                    start_ms = self.paragraph_cards[-1].segments[-1].start_ms
+                if payload.topic and self.live_segments:
+                    start_ms = self.live_segments[-1].start_ms
                     if not self.timeline.entries:
-                        start_ms = self.paragraph_cards[0].segments[0].start_ms
+                        start_ms = self.live_segments[0].start_ms
                     if self.timeline.add_topic(start_ms, payload.topic):
                         result = getattr(self.session, "result", None)
                         if result is not None:
@@ -2012,6 +2127,10 @@ class LivePage(Page):
             self.add_segment(payload)  # type: ignore[arg-type]
         elif name == "translation_failed":
             segment_id, _ = payload  # type: ignore[misc]
+            self.failed_segment_ids.add(str(segment_id))
+            saved = self.segments_by_id.get(str(segment_id))
+            if saved is not None:
+                saved.translated_text = ""
             card = self.transcript_cards.get(str(segment_id))
             if card is not None:
                 card.update_translation(str(segment_id), "", failed=True)
@@ -2021,6 +2140,10 @@ class LivePage(Page):
                 )
         elif name == "segment_retrying":
             segment_id = str(payload)
+            self.failed_segment_ids.discard(segment_id)
+            saved = self.segments_by_id.get(segment_id)
+            if saved is not None:
+                saved.translated_text = ""
             card = self.transcript_cards.get(segment_id)
             if card is not None:
                 card.set_retrying(segment_id)
@@ -2051,8 +2174,7 @@ class LivePage(Page):
             self.reset()
 
     def add_segment(self, segment: Segment, pending: bool = False) -> None:
-        existing = self.transcript_cards.get(segment.id)
-        if existing is not None:
+        if segment.id in self.segments_by_id:
             if segment.translated_text.strip():
                 self.update_translation(segment.id, segment.translated_text)
             return
@@ -2063,20 +2185,38 @@ class LivePage(Page):
         if not pending:
             self.summary.observe_segment(segment)
         self._sync_marker_controls(segment.marker)
-        if not self.paragraph_cards or should_start_new_paragraph(
-            self.paragraph_cards[-1].segments, segment
-        ):
-            card = ParagraphCard(segment)
-            card.set_reading_mode(self.reading_mode)
-            card.retry_requested.connect(self.retry_translation)
-            card.marker_requested.connect(self.set_segment_marker)
-            self.paragraph_cards.append(card)
-            self.cards_layout.insertWidget(max(0, self.cards_layout.count() - 1), card)
+        prior_group_count = len(self.paragraph_groups)
+        new_group = not self.paragraph_groups or should_start_new_paragraph(
+            self.paragraph_groups[-1], segment
+        )
+        if new_group:
+            self.paragraph_groups.append([segment])
         else:
-            card = self.paragraph_cards[-1]
-            card.add_segment(segment)
-        self.transcript_cards[segment.id] = card
+            self.paragraph_groups[-1].append(segment)
+        self.group_by_segment[segment.id] = len(self.paragraph_groups) - 1
+        self.segments_by_id[segment.id] = segment
         self.live_segments.append(segment)
+        if not self.paragraph_cards and prior_group_count == 0:
+            self._render_paragraph_window(0)
+        elif (
+            self.auto_follow
+            and self._visible_end() == prior_group_count
+            and not self._view_dirty
+        ):
+            if new_group:
+                if len(self.paragraph_cards) >= self.VISIBLE_PARAGRAPHS:
+                    self._remove_paragraph_card(self.paragraph_cards.pop(0))
+                    self.visible_start += 1
+                card = self._create_paragraph_card([segment])
+                self.paragraph_cards.append(card)
+                self.cards_layout.insertWidget(max(0, self.cards_layout.count() - 1), card)
+            elif self.paragraph_cards:
+                self.paragraph_cards[-1].add_segment(segment)
+                self.transcript_cards[segment.id] = self.paragraph_cards[-1]
+            self.empty_state.hide()
+        else:
+            self._view_dirty = True
+        self._update_history_navigation()
         self.saved_segment_count += 1
         self.save_quality.setText(f"已保存 {self.saved_segment_count} 句")
         segments = self._all_live_segments()
@@ -2089,19 +2229,18 @@ class LivePage(Page):
     def toggle_latest_marker(self, marker: str) -> None:
         if not self.latest_segment_id:
             return
-        card = self.transcript_cards.get(self.latest_segment_id)
-        if card is None:
+        segment = self.segments_by_id.get(self.latest_segment_id)
+        if segment is None:
             return
-        current = card.marker_for(self.latest_segment_id)
-        updated = "" if current == marker else marker
+        updated = "" if segment.marker == marker else marker
         self.set_segment_marker(self.latest_segment_id, updated)
 
     def set_segment_marker(self, segment_id: str, marker: str) -> None:
         if self.session is None:
             self.notice.show_notice("课堂已结束；请在下一节课堂中标记新记录。", error=False)
             return
-        card = self.transcript_cards.get(segment_id)
-        if card is None:
+        segment = self.segments_by_id.get(segment_id)
+        if segment is None:
             return
         setter = getattr(self.session, "set_segment_marker", None)
         if not callable(setter):
@@ -2109,7 +2248,10 @@ class LivePage(Page):
             return
         try:
             setter(segment_id, marker)
-            card.set_marker(segment_id, marker)
+            segment.marker = marker
+            card = self.transcript_cards.get(segment_id)
+            if card is not None:
+                card.set_marker(segment_id, marker)
             if segment_id == self.latest_segment_id:
                 self._sync_marker_controls(marker)
             self.summary.set_marked_contexts(
@@ -2130,6 +2272,10 @@ class LivePage(Page):
             self.notice.show_notice("当前课堂模式请在课程库中补译失败内容。", error=False)
             return
         card = self.transcript_cards.get(segment_id)
+        self.failed_segment_ids.discard(segment_id)
+        saved = self.segments_by_id.get(segment_id)
+        if saved is not None:
+            saved.translated_text = ""
         if card is not None:
             card.set_retrying(segment_id)
         if segment_id == self.latest_segment_id:
@@ -2137,6 +2283,7 @@ class LivePage(Page):
         try:
             retry(segment_id)
         except Exception as exc:
+            self.failed_segment_ids.add(segment_id)
             if card is not None:
                 card.update_translation(segment_id, "", failed=True)
             if segment_id == self.latest_segment_id:
@@ -2144,6 +2291,11 @@ class LivePage(Page):
             self.notice.show_notice(f"暂时无法重试：{friendly_error(exc)}", error=True)
 
     def update_translation(self, segment_id: str, text: str, final: bool = True) -> None:
+        saved = self.segments_by_id.get(segment_id)
+        if saved is not None:
+            saved.translated_text = text
+        if text:
+            self.failed_segment_ids.discard(segment_id)
         card = self.transcript_cards.get(segment_id)
         if card is not None:
             card.update_translation(segment_id, text, final=final)
@@ -2178,7 +2330,11 @@ class LivePage(Page):
         if self._programmatic_scroll:
             return
         bar = self.scroll.verticalScrollBar()
-        near_bottom = bar.maximum() - value <= 40
+        near_bottom = (
+            bar.maximum() - value <= 40
+            and self._visible_end() == len(self.paragraph_groups)
+            and not self._view_dirty
+        )
         if near_bottom:
             self.auto_follow = True
             self.unseen_segments = 0
@@ -2188,6 +2344,9 @@ class LivePage(Page):
             self._show_return_to_live()
 
     def _scroll_to_latest(self) -> None:
+        latest_start = max(0, len(self.paragraph_groups) - self.VISIBLE_PARAGRAPHS)
+        if self._view_dirty or self.visible_start != latest_start:
+            self._render_paragraph_window(latest_start)
         bar = self.scroll.verticalScrollBar()
         self._programmatic_scroll = True
         try:
@@ -2207,6 +2366,12 @@ class LivePage(Page):
         self.timeline.reset()
         self.transcript_cards.clear()
         self.paragraph_cards.clear()
+        self.paragraph_groups.clear()
+        self.group_by_segment.clear()
+        self.segments_by_id.clear()
+        self.failed_segment_ids.clear()
+        self.visible_start = 0
+        self._view_dirty = False
         self.live_segments = []
         self.latest_segment_id = ""
         self.auto_follow = True
@@ -2216,6 +2381,7 @@ class LivePage(Page):
         self._sync_marker_controls("")
         self.new_items_button.setText("回到实时")
         self.new_items_button.hide()
+        self._update_history_navigation()
         for index in range(self.cards_layout.count() - 1, -1, -1):
             widget = self.cards_layout.itemAt(index).widget()
             if widget is not None and widget is not self.empty_state:
@@ -2229,6 +2395,7 @@ class LivePage(Page):
         self.update_course_context_preview()
 
     def reset(self) -> None:
+        self.clear_session_content()
         self.quick_review.hide()
         self.recent_review.show()
         self.review_button.setText("回顾刚才")
