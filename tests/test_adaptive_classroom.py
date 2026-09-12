@@ -310,7 +310,9 @@ def test_pending_auto_follow_does_not_cancel_a_review_jump() -> None:
 
     live.add_segment(old)
     live.add_segment(later)
+    assert live.follow_timer.isActive()
     live.jump_to_segment(old.id)
+    assert not live.follow_timer.isActive()
     QTest.qWait(80)
 
     assert not live.auto_follow
@@ -319,6 +321,28 @@ def test_pending_auto_follow_does_not_cancel_a_review_jump() -> None:
     live._scroll_to_latest()
     assert live.auto_follow
     assert live.new_items_button.isHidden()
+    window.close()
+    application.processEvents()
+
+
+def test_burst_of_subtitles_uses_one_pending_follow_timer() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    live.add_segment(Segment("First.", "第一句。", 0, 1000))
+    timer_id = live.follow_timer.timerId()
+    assert timer_id > 0
+
+    for index in range(1, 20):
+        live.add_segment(
+            Segment(f"Sentence {index}.", f"句子 {index}。", index * 3000, index * 3000 + 1000)
+        )
+
+    assert live.follow_timer.isActive()
+    assert live.follow_timer.timerId() == timer_id
+    assert len(live.live_segments) == 20
+    live.reset()
+    assert not live.follow_timer.isActive()
     window.close()
     application.processEvents()
 

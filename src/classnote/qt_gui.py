@@ -1222,6 +1222,9 @@ class LivePage(Page):
         self.devices: list[AudioDevice] = []
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
+        self.follow_timer = QTimer(self)
+        self.follow_timer.setSingleShot(True)
+        self.follow_timer.timeout.connect(self._follow_latest_if_enabled)
         self.stop_arm_timer = QTimer(self)
         self.stop_arm_timer.setSingleShot(True)
         self.stop_arm_timer.setInterval(4000)
@@ -1667,6 +1670,7 @@ class LivePage(Page):
             self.review_button.setText("回顾刚才")
         self.scroll.ensureWidgetVisible(target, 0, 8)
         self.auto_follow = False
+        self.follow_timer.stop()
         self._show_return_to_live()
         target.highlight_for_review()
 
@@ -1729,6 +1733,7 @@ class LivePage(Page):
         if self.visible_start <= 0:
             return
         self.auto_follow = False
+        self.follow_timer.stop()
         self._render_paragraph_window(self.visible_start - self.PAGE_PARAGRAPHS)
         self._programmatic_scroll = True
         try:
@@ -1741,6 +1746,7 @@ class LivePage(Page):
         if self._visible_end() >= len(self.paragraph_groups):
             return
         self.auto_follow = False
+        self.follow_timer.stop()
         self._render_paragraph_window(self.visible_start + self.PAGE_PARAGRAPHS)
         self._programmatic_scroll = True
         try:
@@ -2310,7 +2316,8 @@ class LivePage(Page):
 
     def _schedule_transcript_follow(self) -> None:
         if self.auto_follow:
-            QTimer.singleShot(50, self._follow_latest_if_enabled)
+            if not self.follow_timer.isActive():
+                self.follow_timer.start(50)
             return
         self.unseen_segments += 1
         self._show_return_to_live()
@@ -2341,9 +2348,11 @@ class LivePage(Page):
             self.new_items_button.hide()
         else:
             self.auto_follow = False
+            self.follow_timer.stop()
             self._show_return_to_live()
 
     def _scroll_to_latest(self) -> None:
+        self.follow_timer.stop()
         latest_start = max(0, len(self.paragraph_groups) - self.VISIBLE_PARAGRAPHS)
         if self._view_dirty or self.visible_start != latest_start:
             self._render_paragraph_window(latest_start)
@@ -2359,6 +2368,7 @@ class LivePage(Page):
         self.new_items_button.hide()
 
     def clear_session_content(self) -> None:
+        self.follow_timer.stop()
         self.quick_review.hide()
         self.quick_review.reset()
         self.recent_review.show()
