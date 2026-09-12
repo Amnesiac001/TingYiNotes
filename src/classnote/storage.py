@@ -305,7 +305,7 @@ class CourseRepository:
                     """SELECT * FROM segments
                        WHERE course_id = ?
                          AND translation_status IN ('pending', 'retry', 'failed', 'translating')
-                       ORDER BY sort_order, start_ms""",
+                       ORDER BY start_ms, end_ms, sort_order""",
                     (course_id,),
                 ).fetchall()
             )
@@ -386,7 +386,8 @@ class CourseRepository:
         with self.connect() as connection:
             return list(
                 connection.execute(
-                    "SELECT * FROM segments WHERE course_id = ? ORDER BY sort_order, start_ms",
+                    """SELECT * FROM segments WHERE course_id = ?
+                       ORDER BY start_ms, end_ms, sort_order""",
                     (course_id,),
                 ).fetchall()
             )

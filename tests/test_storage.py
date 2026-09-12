@@ -184,6 +184,32 @@ def test_repository_searches_transcript_and_reports_pending(tmp_path: Path) -> N
     assert rows[0]["duration_ms"] == 2500
 
 
+def test_repository_reads_late_subtitles_in_class_time_order(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "late-subtitles.db")
+    result = CourseResult("课堂", "网络", "mic", [], "")
+    repository.create_course(result)
+    repository.add_segment(result.id, Segment("First", "第一", 0, 1000), 0)
+    repository.add_segment(result.id, Segment("Third", "第三", 8000, 9000), 1)
+    repository.add_segment(result.id, Segment("Second", "第二", 4000, 5000), 2)
+
+    assert [row["original_text"] for row in repository.get_course_segments(result.id)] == [
+        "First", "Second", "Third"
+    ]
+
+
+def test_recovery_processes_pending_late_subtitles_in_class_time_order(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "late-pending.db")
+    result = CourseResult("课堂", "网络", "mic", [], "")
+    repository.create_course(result)
+    repository.add_segment(result.id, Segment("Third", "", 8000, 9000), 0, "pending")
+    repository.add_segment(result.id, Segment("First", "", 0, 1000), 1, "pending")
+    repository.add_segment(result.id, Segment("Second", "", 4000, 5000), 2, "pending")
+
+    assert [row["original_text"] for row in repository.pending_segments(result.id)] == [
+        "First", "Second", "Third"
+    ]
+
+
 def test_course_topics_survive_reload_and_follow_course_deletion(tmp_path: Path) -> None:
     path = tmp_path / "topics.db"
     repository = CourseRepository(path)

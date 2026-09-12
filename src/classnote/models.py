@@ -35,11 +35,14 @@ class CourseResult:
 
     @property
     def original_text(self) -> str:
-        return "\n".join(s.original_text for s in self.segments).strip()
+        return "\n".join(s.original_text for s in self._ordered_segments()).strip()
 
     @property
     def translated_text(self) -> str:
-        return "\n".join(s.translated_text for s in self.segments).strip()
+        return "\n".join(s.translated_text for s in self._ordered_segments()).strip()
+
+    def _ordered_segments(self) -> list[Segment]:
+        return sorted(self.segments, key=lambda item: (item.start_ms, item.end_ms))
 
     @staticmethod
     def _marker_prefix(marker: str) -> str:
@@ -52,13 +55,13 @@ class CourseResult:
     def organized_original_text(self) -> str:
         return "\n".join(
             f"{self._marker_prefix(segment.marker)}{segment.original_text}"
-            for segment in self.segments
+            for segment in self._ordered_segments()
         ).strip()
 
     @property
     def organized_translated_text(self) -> str:
         return "\n".join(
             f"{self._marker_prefix(segment.marker)}{segment.translated_text}"
-            for segment in self.segments
+            for segment in self._ordered_segments()
             if segment.translated_text.strip()
         ).strip()

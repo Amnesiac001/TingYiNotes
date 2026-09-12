@@ -52,7 +52,7 @@ from .live import AudioDevice, AudioLevelResult, LiveCourseSession, capture_audi
 from .live_summary import LiveSummarySnapshot
 from .marked_context import MarkedContext, build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult, Segment
-from .paragraphs import group_segments, should_start_new_paragraph
+from .paragraphs import group_segments, paragraph_time_bounds, should_start_new_paragraph
 from .recent_index import RecentSegmentIndex
 from .platforms import (
     IS_APPLE_SILICON,
@@ -561,10 +561,10 @@ class ParagraphCard(QFrame):
         self.render(update_details=final)
 
     def render(self, update_details: bool = True) -> None:
-        first = self.segments[0]
         last = self.segments[-1]
-        start = self._time(first.start_ms)
-        end = self._time(last.end_ms)
+        start_ms, end_ms = paragraph_time_bounds(self.segments)
+        start = self._time(start_ms)
+        end = self._time(end_ms)
         self.meta.setText(f"{start}–{end}  ·  {len(self.segments)} 句")
         markers = {item.marker for item in self.segments}
         badges = []
@@ -745,7 +745,7 @@ class RecentReviewPane(QFrame):
             )
             return
         start = ParagraphCard._time(recent[0].start_ms)
-        end = ParagraphCard._time(recent[-1].end_ms)
+        end = ParagraphCard._time(max(item.end_ms for item in recent))
         self.meta.setText(f"{start}–{end} · {len(recent)} 句")
         self.body.setText(" ".join(item.translated_text.strip() for item in recent))
 
@@ -861,7 +861,7 @@ class QuickReviewPane(QFrame):
             self.english.setText("")
             return
         start = format_duration(self.selected[0].start_ms)
-        end = format_duration(self.selected[-1].end_ms)
+        end = format_duration(max(item.end_ms for item in self.selected))
         topic = f"当前主题：{self.topic} · " if self.topic else ""
         self.meta.setText(f"{topic}{start}–{end} · {len(self.selected)} 句 · 已保存内容摘录")
         self.body.setText(" ".join(
@@ -1642,7 +1642,7 @@ class LivePage(Page):
             return
         index = next(
             (index for index, group in enumerate(self.paragraph_groups)
-             if group[-1].end_ms >= start_ms),
+             if paragraph_time_bounds(group)[1] >= start_ms),
             len(self.paragraph_groups) - 1,
         )
         self._jump_to_group(index)
@@ -1697,6 +1697,8 @@ class LivePage(Page):
         for segment in card.segments:
             self.transcript_cards.pop(segment.id, None)
         self.cards_layout.removeWidget(card)
+        card.hide()
+        card.setParent(None)
         card.deleteLater()
 
     def _render_paragraph_window(self, start: int) -> None:
@@ -2089,9 +2091,10 @@ class LivePage(Page):
                 self.recent_review.set_topic(payload.topic)
                 self.quick_review.set_topic(payload.topic)
                 if payload.topic and self.live_segments:
-                    start_ms = self.live_segments[-1].start_ms
+                    latest = self.segments_by_id.get(self.latest_segment_id)
+                    start_ms = latest.start_ms if latest is not None else 0
                     if not self.timeline.entries:
-                        start_ms = self.live_segments[0].start_ms
+                        start_ms = min(item.start_ms for item in self.live_segments)
                     if self.timeline.add_topic(start_ms, payload.topic):
                         result = getattr(self.session, "result", None)
                         if result is not None:
@@ -2184,13 +2187,34 @@ class LivePage(Page):
             if segment.translated_text.strip():
                 self.update_translation(segment.id, segment.translated_text)
             return
-        self.latest_segment_id = segment.id
+        current_latest = self.segments_by_id.get(self.latest_segment_id)
+        late_arrival = current_latest is not None and (
+            segment.start_ms, segment.end_ms
+        ) < (current_latest.start_ms, current_latest.end_ms)
+        if not late_arrival:
+            self.latest_segment_id = segment.id
+            self.partial.setText(segment.original_text)
+            self.current_translation.setText(segment.translated_text or "正在翻译……")
+            if not pending:
+                self.summary.observe_segment(segment)
+            self._sync_marker_controls(segment.marker)
         self.empty_state.hide()
-        self.partial.setText(segment.original_text)
-        self.current_translation.setText(segment.translated_text or "正在翻译……")
-        if not pending:
-            self.summary.observe_segment(segment)
-        self._sync_marker_controls(segment.marker)
+        self.segments_by_id[segment.id] = segment
+        self.live_segments.append(segment)
+        if late_arrival:
+            self._rebuild_paragraphs_after_late_arrival()
+        else:
+            self._append_current_paragraph(segment)
+        self.saved_segment_count += 1
+        self.save_quality.setText(f"已保存 {self.saved_segment_count} 句")
+        segments = self._all_live_segments()
+        self.recent_review.set_segments(segments)
+        self.summary.set_marked_contexts(build_marked_contexts(segments))
+        if not self.quick_review.isHidden():
+            self.quick_review.set_segments(segments)
+        self._schedule_transcript_follow()
+
+    def _append_current_paragraph(self, segment: Segment) -> None:
         prior_group_count = len(self.paragraph_groups)
         new_group = not self.paragraph_groups or should_start_new_paragraph(
             self.paragraph_groups[-1], segment
@@ -2200,8 +2224,6 @@ class LivePage(Page):
         else:
             self.paragraph_groups[-1].append(segment)
         self.group_by_segment[segment.id] = len(self.paragraph_groups) - 1
-        self.segments_by_id[segment.id] = segment
-        self.live_segments.append(segment)
         if not self.paragraph_cards and prior_group_count == 0:
             self._render_paragraph_window(0)
         elif (
@@ -2223,14 +2245,30 @@ class LivePage(Page):
         else:
             self._view_dirty = True
         self._update_history_navigation()
-        self.saved_segment_count += 1
-        self.save_quality.setText(f"已保存 {self.saved_segment_count} 句")
-        segments = self._all_live_segments()
-        self.recent_review.set_segments(segments)
-        self.summary.set_marked_contexts(build_marked_contexts(segments))
-        if not self.quick_review.isHidden():
-            self.quick_review.set_segments(segments)
-        self._schedule_transcript_follow()
+
+    def _rebuild_paragraphs_after_late_arrival(self) -> None:
+        anchor_id = ""
+        if self.paragraph_cards and self.visible_start < len(self.paragraph_groups):
+            anchor_id = self.paragraph_groups[self.visible_start][0].id
+        scroll_bar = self.scroll.verticalScrollBar()
+        old_scroll_value = scroll_bar.value()
+        self.paragraph_groups = group_segments(self.live_segments)
+        self.group_by_segment = {
+            item.id: index
+            for index, group in enumerate(self.paragraph_groups)
+            for item in group
+        }
+        if self.auto_follow:
+            start = max(0, len(self.paragraph_groups) - self.VISIBLE_PARAGRAPHS)
+        else:
+            start = self.group_by_segment.get(anchor_id, self.visible_start)
+        self._render_paragraph_window(start)
+        if not self.auto_follow:
+            self._programmatic_scroll = True
+            try:
+                scroll_bar.setValue(min(old_scroll_value, scroll_bar.maximum()))
+            finally:
+                self._programmatic_scroll = False
 
     def toggle_latest_marker(self, marker: str) -> None:
         if not self.latest_segment_id:
@@ -2767,9 +2805,9 @@ class LibraryPage(Page):
         issue = f"\n\n> {error_message}" if error_message else ""
         transcript = []
         for paragraph in group_segments(segments):
-            first, last = paragraph[0], paragraph[-1]
-            start_seconds = max(0, first.start_ms // 1000)
-            end_seconds = max(0, last.end_ms // 1000)
+            start_ms, end_ms = paragraph_time_bounds(paragraph)
+            start_seconds = max(0, start_ms // 1000)
+            end_seconds = max(0, end_ms // 1000)
             stamp = (
                 f"{start_seconds // 60:02d}:{start_seconds % 60:02d}–"
                 f"{end_seconds // 60:02d}:{end_seconds % 60:02d} · {len(paragraph)} 句"

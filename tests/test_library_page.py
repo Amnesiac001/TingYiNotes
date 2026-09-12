@@ -41,3 +41,25 @@ def test_library_selects_exact_course_shows_transcript_and_deletes(monkeypatch, 
     page.close()
     page.deleteLater()
     app.processEvents()
+
+
+def test_library_preview_uses_full_range_of_overlapping_sentences(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "overlap-preview.db")
+    result = CourseResult(
+        "课堂", "网络", "mic",
+        [
+            Segment("Long first.", "第一句。", 0, 10_000),
+            Segment("Short overlap.", "第二句。", 1000, 2000),
+        ],
+        "# 整理笔记",
+    )
+    repository.save(result)
+    page = LibraryPage(repository)
+    page.select_course(result.id)
+    app.processEvents()
+
+    assert "00:00–00:10 · 2 句" in page.preview.toPlainText()
+    page.close()
+    page.deleteLater()
+    app.processEvents()

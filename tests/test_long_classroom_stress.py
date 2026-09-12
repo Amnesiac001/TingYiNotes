@@ -58,6 +58,14 @@ def test_long_classroom_keeps_widget_count_bounded_in_qt_event_loop() -> None:
     assert len(window.findChildren(ParagraphCard)) <= 6
     live.jump_to_segment(segments[10].id)
     assert segments[10].id in live.transcript_cards
+    late = Segment("Late English.", "晚到中文。", 151_500, 152_000)
+    live.add_segment(late)
+    application.processEvents()
+    assert len(live.live_segments) == 481
+    assert late.id in live.group_by_segment
+    assert live.latest_segment_id == segments[-1].id
+    assert len(live.paragraph_cards) <= 6
+    assert len(window.findChildren(ParagraphCard)) <= 6
     live.reset()
     window.close()
     application.processEvents()

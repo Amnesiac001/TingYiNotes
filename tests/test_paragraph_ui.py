@@ -5,7 +5,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from classnote.models import Segment
-from classnote.qt_gui import ParagraphCard, QuickReviewPane, RecentReviewPane
+from classnote.qt_gui import MainWindow, ParagraphCard, QuickReviewPane, RecentReviewPane
 
 
 def test_paragraph_card_grows_and_updates_one_sentence_translation() -> None:
@@ -24,6 +24,17 @@ def test_paragraph_card_grows_and_updates_one_sentence_translation() -> None:
     assert card.chinese.text() == "第一句。 第二句。"
     assert "Second sentence." in card.details.text()
 
+    card.close()
+    card.deleteLater()
+    app.processEvents()
+
+
+def test_paragraph_card_uses_latest_end_for_overlapping_sentences() -> None:
+    app = QApplication.instance() or QApplication([])
+    card = ParagraphCard(Segment("Long first.", "第一句。", 0, 10_000))
+    card.add_segment(Segment("Short overlap.", "第二句。", 1000, 2000))
+
+    assert "00:00–00:10" in card.meta.text()
     card.close()
     card.deleteLater()
     app.processEvents()
@@ -184,6 +195,21 @@ def test_quick_review_orders_a_late_subtitle_by_class_time() -> None:
     app.processEvents()
 
 
+def test_overlapping_quick_review_reads_chronologically_and_shows_full_range() -> None:
+    app = QApplication.instance() or QApplication([])
+    review = QuickReviewPane()
+    review.set_segments([
+        Segment("Long first.", "第一句。", 0, 10_000),
+        Segment("Short second.", "第二句。", 4000, 5000),
+    ])
+
+    assert review.body.text() == "第一句。 第二句。"
+    assert "00:00–00:10" in review.meta.text()
+    review.close()
+    review.deleteLater()
+    app.processEvents()
+
+
 def test_quick_review_switches_ranges_and_can_reveal_original() -> None:
     app = QApplication.instance() or QApplication([])
     review = QuickReviewPane()
@@ -211,6 +237,54 @@ def test_quick_review_switches_ranges_and_can_reveal_original() -> None:
     assert review.english.isHidden()
     review.close()
     review.deleteLater()
+    app.processEvents()
+
+
+def test_full_transcript_places_late_subtitle_without_replacing_current_line() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    live = window.live_page
+    live.workspace.show()
+    first = Segment("First.", "第一句。", 0, 1000)
+    second = Segment("Second, arrived late.", "第二句。", 4000, 5000)
+    third = Segment("Third, current.", "第三句。", 8000, 9000)
+    live.add_segment(first)
+    live.add_segment(third)
+    live.jump_to_segment(first.id)
+    assert not live.auto_follow
+
+    live.add_segment(second)
+
+    assert [group[0].id for group in live.paragraph_groups] == [
+        first.id, second.id, third.id
+    ]
+    assert live.latest_segment_id == third.id
+    assert live.partial.text() == "Third, current."
+    live.update_translation(second.id, "迟到译文。")
+    assert live.current_translation.text() == "第三句。"
+    assert not live.auto_follow
+    assert first.id in live.transcript_cards
+    live.jump_to_segment(second.id)
+    assert second.id in live.transcript_cards
+    window.close()
+    app.processEvents()
+
+
+def test_topic_jump_stays_with_overlapping_long_paragraph(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    live = window.live_page
+    live.add_segment(Segment("Long first.", "第一句。", 0, 10_000))
+    live.add_segment(Segment("Short overlap.", "第二句。", 1000, 2000))
+    live.add_segment(Segment("Next topic.", "下一主题。", 13_000, 14_000))
+    selected: list[int] = []
+    monkeypatch.setattr(live, "_jump_to_group", selected.append)
+
+    live.jump_to_topic(8000)
+
+    assert selected == [0]
+    window.close()
     app.processEvents()
 
 

@@ -125,3 +125,32 @@ def test_export_without_topics_omits_empty_timeline(tmp_path: Path) -> None:
     result = CourseResult("课堂", "网络", "mic", [], "# 笔记")
     content = export_markdown(result, tmp_path).read_text(encoding="utf-8")
     assert "## 课堂脉络" not in content
+
+
+def test_export_orders_late_subtitle_by_class_time(tmp_path: Path) -> None:
+    result = CourseResult(
+        "课堂", "网络", "mic",
+        [
+            Segment("First.", "第一句。", 0, 1000),
+            Segment("Third.", "第三句。", 8000, 9000),
+            Segment("Second.", "第二句。", 4000, 5000),
+        ],
+        "# 笔记",
+    )
+    content = export_markdown(result, tmp_path).read_text(encoding="utf-8")
+
+    assert content.index("First.") < content.index("Second.") < content.index("Third.")
+
+
+def test_export_uses_latest_end_of_overlapping_sentences(tmp_path: Path) -> None:
+    result = CourseResult(
+        "课堂", "网络", "mic",
+        [
+            Segment("Long first.", "第一句。", 0, 10_000),
+            Segment("Short overlap.", "第二句。", 1000, 2000),
+        ],
+        "# 笔记",
+    )
+
+    content = export_markdown(result, tmp_path).read_text(encoding="utf-8")
+    assert "### 00:00–00:10 · 2 句" in content

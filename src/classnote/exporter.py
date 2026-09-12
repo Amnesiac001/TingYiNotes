@@ -8,7 +8,7 @@ from typing import Iterable
 
 from .marked_context import build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult
-from .paragraphs import group_segments
+from .paragraphs import group_segments, paragraph_time_bounds
 
 
 def safe_filename(value: str) -> str:
@@ -25,7 +25,7 @@ def export_markdown(
     path = export_dir / f"{safe_filename(result.title)}-{result.id[:8]}.md"
     blocks = []
     for paragraph in group_segments(result.segments):
-        first, last = paragraph[0], paragraph[-1]
+        start_ms, end_ms = paragraph_time_bounds(paragraph)
         english = " ".join(segment.original_text.strip() for segment in paragraph)
         chinese = " ".join(
             segment.translated_text.strip() for segment in paragraph if segment.translated_text.strip()
@@ -37,7 +37,7 @@ def export_markdown(
         if "question" in markers:
             marker_text += " · ❓ 疑问"
         block = (
-            f"### {format_time(first.start_ms)}–{format_time(last.end_ms)} · {len(paragraph)} 句{marker_text}\n\n"
+            f"### {format_time(start_ms)}–{format_time(end_ms)} · {len(paragraph)} 句{marker_text}\n\n"
             f"**English**\n\n{english}"
         )
         if chinese:

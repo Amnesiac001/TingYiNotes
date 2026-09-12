@@ -31,3 +31,16 @@ def test_index_keeps_mutated_translation_and_rebuilds_for_a_new_course() -> None
     assert [item.original_text for item in index.recent(5000)] == ["New course"]
     index.clear()
     assert index.recent(5000) == []
+
+
+def test_overlapping_recent_sentences_are_read_by_start_time() -> None:
+    index = RecentSegmentIndex()
+    index.update([
+        Segment("Long first", "第一句", 1000, 10_000),
+        Segment("Short second", "第二句", 4000, 5000),
+        Segment("Third", "第三句", 8000, 9000),
+    ])
+
+    assert [item.original_text for item in index.recent(20_000)] == [
+        "Long first", "Short second", "Third"
+    ]

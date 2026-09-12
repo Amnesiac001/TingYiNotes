@@ -6,7 +6,7 @@ from .models import Segment
 
 
 class RecentSegmentIndex:
-    """Index live subtitles by end time for bounded classroom review windows."""
+    """Select by latest end time, then read selected subtitles by class start time."""
 
     def __init__(self) -> None:
         self._source: list[Segment] | None = None
@@ -31,7 +31,10 @@ class RecentSegmentIndex:
         if not self._ordered:
             return []
         cutoff = self._ends[-1] - window_ms
-        return self._ordered[bisect_left(self._ends, cutoff):]
+        return sorted(
+            self._ordered[bisect_left(self._ends, cutoff):],
+            key=lambda item: (item.start_ms, item.end_ms),
+        )
 
     def clear(self) -> None:
         self._source = None

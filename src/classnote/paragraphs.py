@@ -19,6 +19,14 @@ class ParagraphRules:
 
 DEFAULT_PARAGRAPH_RULES = ParagraphRules()
 
+
+def paragraph_time_bounds(segments: Sequence[Segment]) -> tuple[int, int]:
+    """Cover every overlapping sentence, not merely the last one's end."""
+    if not segments:
+        raise ValueError("段落不能为空。")
+    return min(item.start_ms for item in segments), max(item.end_ms for item in segments)
+
+
 _TRANSITION = re.compile(
     r"^(?:now\s+(?:let(?:'s| us)|we(?:'ll| will))|next\b|moving on\b|"
     r"let(?:'s| us)\s+(?:move|turn)|another\s+(?:point|topic|question)|"
@@ -35,10 +43,9 @@ def should_start_new_paragraph(
     """Return whether an incoming stable sentence should begin a new display paragraph."""
     if not current:
         return False
-    first = current[0]
-    previous = current[-1]
-    gap_ms = max(0, incoming.start_ms - previous.end_ms)
-    proposed_duration = max(0, incoming.end_ms - first.start_ms)
+    first_start, current_end = paragraph_time_bounds(current)
+    gap_ms = max(0, incoming.start_ms - current_end)
+    proposed_duration = max(0, max(current_end, incoming.end_ms) - first_start)
     proposed_chars = sum(len(item.original_text.strip()) for item in current) + len(
         incoming.original_text.strip()
     )
@@ -62,7 +69,7 @@ def group_segments(
     rules: ParagraphRules = DEFAULT_PARAGRAPH_RULES,
 ) -> list[list[Segment]]:
     paragraphs: list[list[Segment]] = []
-    for segment in segments:
+    for segment in sorted(segments, key=lambda item: (item.start_ms, item.end_ms)):
         if not paragraphs or should_start_new_paragraph(paragraphs[-1], segment, rules):
             paragraphs.append([segment])
         else:

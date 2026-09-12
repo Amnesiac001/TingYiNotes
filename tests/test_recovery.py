@@ -73,3 +73,35 @@ def test_recovery_export_failure_keeps_draft_and_requires_attention(
     assert saved["status"] == "needs_attention"
     assert saved["notes_markdown"].startswith("# 待恢复课堂")
     assert saved["export_path"] == ""
+
+
+def test_recovery_preserves_class_time_with_late_and_overlapping_subtitles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLASSNOTE_EXPORT_DIR", str(tmp_path / "exports"))
+    repository = CourseRepository(tmp_path / "late-recovery.db")
+    result = CourseResult("交叠课堂", "网络", "mic", [], "")
+    repository.create_course(result)
+    repository.add_segment(result.id, Segment("First", "第一", 0, 10_000), 0, "completed")
+    repository.add_segment(result.id, Segment("Third", "", 13_000, 14_000), 1, "retry")
+    repository.add_segment(result.id, Segment("Second", "第二", 1000, 2000), 2, "completed")
+    repository.add_course_topic(result.id, 8000, "第一部分")
+    repository.set_course_state(result.id, "interrupted")
+
+    recovered, path = recover_course(
+        result.id,
+        repository,
+        settings=Settings.load(),
+        text_processor=RecoveryProcessor(),
+    )
+
+    assert [item.original_text for item in recovered.segments] == [
+        "First", "Second", "Third"
+    ]
+    assert recovered.notes_markdown.index("第一") < recovered.notes_markdown.index("第二")
+    content = path.read_text(encoding="utf-8")
+    assert "### 00:00–00:10 · 2 句" in content
+    assert "- 00:08　第一部分" in content
+    transcript = content.split("## 英中对照记录", 1)[1]
+    assert transcript.index("First Second") < transcript.index("Third")
+    assert repository.get_course(result.id)["status"] == "completed"
