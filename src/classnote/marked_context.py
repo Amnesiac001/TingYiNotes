@@ -28,6 +28,8 @@ def build_marked_contexts(
     segments: list[Segment], before_ms: int = 20_000, after_ms: int = 20_000
 ) -> list[MarkedContext]:
     """Expand each manual marker into nearby saved subtitles, without model calls."""
+    if not any(item.marker in MARKER_LABELS for item in segments):
+        return []
     ordered = sorted(segments, key=lambda item: (item.start_ms, item.end_ms))
     starts = [item.start_ms for item in ordered]
     prefix_max_ends: list[int] = []

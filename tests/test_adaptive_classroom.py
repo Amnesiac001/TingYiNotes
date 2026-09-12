@@ -414,6 +414,12 @@ def test_live_workspace_shows_durable_english_save_count() -> None:
 
     assert live.saved_segment_count == 1
     assert live.save_quality.text() == "已保存 1 句"
+    assert live._all_live_segments() == [segment]
+    live.update_translation(segment.id, "后来完成的译文。")
+    live.add_segment(Segment("Saved first", "", 0, 1000, id=segment.id), pending=True)
+    assert live.transcript_cards[segment.id].chinese.text() == "后来完成的译文。"
+    live.clear_session_content()
+    assert live._all_live_segments() == []
     window.close()
     application.processEvents()
 

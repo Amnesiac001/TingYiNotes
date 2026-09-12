@@ -53,6 +53,7 @@ from .live_summary import LiveSummarySnapshot
 from .marked_context import MarkedContext, build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult, Segment
 from .paragraphs import group_segments, should_start_new_paragraph
+from .recent_index import RecentSegmentIndex
 from .platforms import (
     IS_APPLE_SILICON,
     IS_MACOS,
@@ -681,6 +682,7 @@ class RecentReviewPane(QFrame):
         super().__init__()
         self.topic = ""
         self.segments: list[Segment] = []
+        self.segment_index = RecentSegmentIndex()
         self.setObjectName("RecentReview")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 11, 15, 13)
@@ -707,39 +709,40 @@ class RecentReviewPane(QFrame):
 
     def set_segments(self, segments: list[Segment]) -> None:
         self.segments = segments
+        self.segment_index.update(segments)
         self._render()
 
     def reset(self) -> None:
         self.topic = ""
         self.segments = []
+        self.segment_index.clear()
         self._render()
 
     def _recent_segments(self) -> list[Segment]:
-        translated = [item for item in self.segments if item.translated_text.strip()]
-        if not translated:
-            return []
-        latest_end = max(item.end_ms for item in translated)
-        candidates = [
-            item
-            for item in translated
-            if item.end_ms >= max(0, latest_end - self.WINDOW_MS)
-        ][-self.MAX_SEGMENTS :]
         selected: list[Segment] = []
         characters = 0
-        for item in reversed(candidates):
+        for item in reversed(self.segment_index.recent(self.WINDOW_MS)):
+            if not item.translated_text.strip():
+                continue
             length = len(item.translated_text.strip())
             if selected and characters + length > self.MAX_CHARS:
                 break
             selected.append(item)
             characters += length
+            if len(selected) >= self.MAX_SEGMENTS:
+                break
         return list(reversed(selected))
 
     def _render(self) -> None:
         recent = self._recent_segments()
         self.title.setText(self.topic or "最近几分钟")
         if not recent:
-            self.meta.setText("等待稳定中文")
-            self.body.setText("翻译完成后，这里会把老师刚讲的内容合并成一段，方便快速跟上课堂。")
+            self.meta.setText("等待最近中文" if self.segments else "等待稳定中文")
+            self.body.setText(
+                "最近两分钟暂无稳定中文；英文已保存在下方记录，可用“回顾刚才”查看。"
+                if self.segments else
+                "翻译完成后，这里会把老师刚讲的内容合并成一段，方便快速跟上课堂。"
+            )
             return
         start = ParagraphCard._time(recent[0].start_ms)
         end = ParagraphCard._time(recent[-1].end_ms)
@@ -760,6 +763,7 @@ class QuickReviewPane(QFrame):
         super().__init__()
         self.setObjectName("QuickReview")
         self.segments: list[Segment] = []
+        self.segment_index = RecentSegmentIndex()
         self.selected: list[Segment] = []
         self.topic = ""
         layout = QVBoxLayout(self)
@@ -818,6 +822,7 @@ class QuickReviewPane(QFrame):
 
     def set_segments(self, segments: list[Segment]) -> None:
         self.segments = segments
+        self.segment_index.update(segments)
         self.refresh()
 
     def set_topic(self, topic: str) -> None:
@@ -826,6 +831,7 @@ class QuickReviewPane(QFrame):
 
     def reset(self) -> None:
         self.segments = []
+        self.segment_index.clear()
         self.topic = ""
         self.range_choice.setCurrentIndex(1)
         self.english.hide()
@@ -834,17 +840,17 @@ class QuickReviewPane(QFrame):
 
     def refresh(self, *_: object) -> None:
         self.selected = []
-        if self.segments:
-            latest_end = max(item.end_ms for item in self.segments)
-            cutoff = latest_end - self.WINDOWS[self.range_choice.currentIndex()]
-            candidates = [item for item in self.segments if item.end_ms >= cutoff]
+        candidates = self.segment_index.recent(self.WINDOWS[self.range_choice.currentIndex()])
+        if candidates:
             characters = 0
-            for item in reversed(candidates[-self.MAX_SEGMENTS :]):
+            for item in reversed(candidates):
                 text = item.translated_text.strip() or item.original_text.strip()
                 if self.selected and characters + len(text) > self.MAX_CHARS:
                     break
                 self.selected.append(item)
                 characters += len(text)
+                if len(self.selected) >= self.MAX_SEGMENTS:
+                    break
             self.selected.reverse()
         available = bool(self.selected)
         self.english_button.setEnabled(available)
@@ -1191,6 +1197,7 @@ class LivePage(Page):
         self.session: object | None = None
         self.transcript_cards: dict[str, ParagraphCard] = {}
         self.paragraph_cards: list[ParagraphCard] = []
+        self.live_segments: list[Segment] = []
         self.latest_segment_id = ""
         self.auto_follow = True
         self.unseen_segments = 0
@@ -1655,7 +1662,7 @@ class LivePage(Page):
         self.jump_to_topic(start_ms)
 
     def _all_live_segments(self) -> list[Segment]:
-        return [item for paragraph in self.paragraph_cards for item in paragraph.segments]
+        return self.live_segments
 
     def set_fullscreen_state(self, fullscreen: bool) -> None:
         self.fullscreen_button.setText("退出全屏  Esc" if fullscreen else "进入全屏")
@@ -2046,7 +2053,8 @@ class LivePage(Page):
     def add_segment(self, segment: Segment, pending: bool = False) -> None:
         existing = self.transcript_cards.get(segment.id)
         if existing is not None:
-            existing.update_translation(segment.id, segment.translated_text)
+            if segment.translated_text.strip():
+                self.update_translation(segment.id, segment.translated_text)
             return
         self.latest_segment_id = segment.id
         self.empty_state.hide()
@@ -2068,6 +2076,7 @@ class LivePage(Page):
             card = self.paragraph_cards[-1]
             card.add_segment(segment)
         self.transcript_cards[segment.id] = card
+        self.live_segments.append(segment)
         self.saved_segment_count += 1
         self.save_quality.setText(f"已保存 {self.saved_segment_count} 句")
         segments = self._all_live_segments()
@@ -2198,6 +2207,7 @@ class LivePage(Page):
         self.timeline.reset()
         self.transcript_cards.clear()
         self.paragraph_cards.clear()
+        self.live_segments = []
         self.latest_segment_id = ""
         self.auto_follow = True
         self.unseen_segments = 0

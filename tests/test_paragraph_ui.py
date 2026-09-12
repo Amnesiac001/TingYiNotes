@@ -128,6 +128,62 @@ def test_recent_review_keeps_a_bounded_two_minute_chinese_window() -> None:
     app.processEvents()
 
 
+def test_recent_review_does_not_present_stale_chinese_as_recent() -> None:
+    app = QApplication.instance() or QApplication([])
+    review = RecentReviewPane()
+    review.set_segments([
+        Segment("Old translated.", "旧译文。", 0, 1000),
+        Segment("Current pending.", "", 180_000, 181_000),
+    ])
+
+    assert "旧译文" not in review.body.text()
+    assert "最近两分钟暂无稳定中文" in review.body.text()
+    assert "英文已保存" in review.body.text()
+    review.close()
+    review.deleteLater()
+    app.processEvents()
+
+
+def test_long_review_history_keeps_only_the_recent_tail() -> None:
+    app = QApplication.instance() or QApplication([])
+    segments = [
+        Segment(f"English {index}.", f"中文 {index}。", index * 5000, index * 5000 + 1000)
+        for index in range(1000)
+    ]
+    recent = RecentReviewPane()
+    quick = QuickReviewPane()
+    recent.set_segments(segments)
+    quick.set_segments(segments)
+
+    assert "中文 999" in recent.body.text()
+    assert "中文 900" not in recent.body.text()
+    assert "中文 999" in quick.body.text()
+    assert "中文 900" not in quick.body.text()
+    assert len(quick.selected) <= quick.MAX_SEGMENTS
+    recent.close()
+    recent.deleteLater()
+    quick.close()
+    quick.deleteLater()
+    app.processEvents()
+
+
+def test_quick_review_orders_a_late_subtitle_by_class_time() -> None:
+    app = QApplication.instance() or QApplication([])
+    quick = QuickReviewPane()
+    history = [
+        Segment("First.", "第一句。", 0, 1000),
+        Segment("Third.", "第三句。", 8000, 9000),
+    ]
+    quick.set_segments(history)
+    history.append(Segment("Second, arrived late.", "第二句。", 4000, 5000))
+    quick.set_segments(history)
+
+    assert quick.body.text() == "第一句。 第二句。 第三句。"
+    quick.close()
+    quick.deleteLater()
+    app.processEvents()
+
+
 def test_quick_review_switches_ranges_and_can_reveal_original() -> None:
     app = QApplication.instance() or QApplication([])
     review = QuickReviewPane()
