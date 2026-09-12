@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from typing import Iterable
 
 from .marked_context import build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult
@@ -15,7 +16,11 @@ def safe_filename(value: str) -> str:
     return cleaned[:100] or "课堂笔记"
 
 
-def export_markdown(result: CourseResult, export_dir: Path) -> Path:
+def export_markdown(
+    result: CourseResult,
+    export_dir: Path,
+    topics: Iterable[tuple[int, str]] = (),
+) -> Path:
     export_dir.mkdir(parents=True, exist_ok=True)
     path = export_dir / f"{safe_filename(result.title)}-{result.id[:8]}.md"
     blocks = []
@@ -39,11 +44,20 @@ def export_markdown(result: CourseResult, export_dir: Path) -> Path:
             block += f"\n\n**中文**\n\n{chinese}"
         blocks.append(block)
     transcript = "\n\n---\n\n".join(blocks)
+    topic_lines = [
+        f"- {format_time(start_ms)}　{' '.join(title.split())}"
+        for start_ms, title in sorted(topics, key=lambda item: item[0])
+        if title.strip()
+    ]
+    topic_section = ""
+    if topic_lines:
+        topic_section = "## 课堂脉络\n\n" + "\n".join(topic_lines) + "\n\n---\n\n"
     marked_section = marked_contexts_markdown(build_marked_contexts(result.segments))
     if marked_section:
         marked_section = f"{marked_section}\n\n---\n\n"
     content = (
         f"{result.notes_markdown.rstrip()}\n\n---\n\n"
+        f"{topic_section}"
         f"{marked_section}"
         f"## 英中对照记录\n\n{transcript}\n"
     )

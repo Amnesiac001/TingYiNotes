@@ -106,3 +106,22 @@ def test_successful_reexport_replaces_note_without_temporary_file(tmp_path: Path
     assert export_markdown(result, tmp_path) == path
     assert path.read_text(encoding="utf-8").startswith("# 更新后的笔记")
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_export_places_saved_topics_in_chronological_order(tmp_path: Path) -> None:
+    result = CourseResult("课堂", "网络", "mic", [], "# 笔记")
+    content = export_markdown(
+        result,
+        tmp_path,
+        topics=[(125_000, " TCP   拥塞控制 "), (0, "课程导入"), (200_000, "  ")],
+    ).read_text(encoding="utf-8")
+
+    assert "## 课堂脉络\n\n- 00:00　课程导入\n- 02:05　TCP 拥塞控制" in content
+    assert content.index("## 课堂脉络") < content.index("## 英中对照记录")
+    assert "03:20" not in content
+
+
+def test_export_without_topics_omits_empty_timeline(tmp_path: Path) -> None:
+    result = CourseResult("课堂", "网络", "mic", [], "# 笔记")
+    content = export_markdown(result, tmp_path).read_text(encoding="utf-8")
+    assert "## 课堂脉络" not in content

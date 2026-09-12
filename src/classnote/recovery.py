@@ -90,7 +90,11 @@ def recover_course(
             result.organized_translated_text,
         )
         repository.save_notes_draft(course_id, result.notes_markdown)
-        path = export_markdown(result, current_settings.export_dir).resolve()
+        topics = [
+            (int(topic["start_ms"]), str(topic["title"]))
+            for topic in repository.get_course_topics(course_id)
+        ]
+        path = export_markdown(result, current_settings.export_dir, topics).resolve()
         repository.finalize_course(course_id, result.notes_markdown, str(path))
         notify("补译和课堂整理已完成。")
         return result, path

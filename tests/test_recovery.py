@@ -29,6 +29,7 @@ def test_recover_course_translates_pending_rebuilds_notes_and_exports(
     pending = Segment("Second", "", 1000, 2000)
     repository.add_segment(result.id, completed, 0, "completed")
     repository.add_segment(result.id, pending, 1, "retry")
+    repository.add_course_topic(result.id, 1000, "第二部分")
     repository.set_course_state(result.id, "interrupted")
 
     recovered, path = recover_course(
@@ -40,6 +41,7 @@ def test_recover_course_translates_pending_rebuilds_notes_and_exports(
 
     assert path.exists()
     assert "已补译：Second" in path.read_text(encoding="utf-8")
+    assert "- 00:01　第二部分" in path.read_text(encoding="utf-8")
     assert recovered.notes_markdown.startswith("# 待恢复课堂")
     assert repository.pending_segments(result.id) == []
     assert repository.get_course(result.id)["status"] == "completed"
