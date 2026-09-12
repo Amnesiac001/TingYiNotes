@@ -86,6 +86,12 @@ COURSE_STATUS_LABELS = {
     "failed": "未完成",
 }
 
+READING_MODES = {
+    "chinese": "中文优先",
+    "bilingual": "双语对照",
+    "english": "英文优先",
+}
+
 UI_FONT_FAMILY = "PingFang SC" if IS_MACOS else "Microsoft YaHei UI"
 UI_FONT_STACK = (
     '"PingFang SC", "SF Pro Text", "Helvetica Neue"'
@@ -421,8 +427,10 @@ class ParagraphCard(QFrame):
         super().__init__()
         self.segments: list[Segment] = [segment]
         self.failed_ids: set[str] = set()
+        self.reading_mode = "chinese"
         self.setObjectName("Transcript")
         layout = QVBoxLayout(self)
+        self.body_layout = layout
         layout.setContentsMargins(4, 12, 8, 15)
         layout.setSpacing(7)
         heading = QHBoxLayout()
@@ -484,7 +492,29 @@ class ParagraphCard(QFrame):
         layout.addWidget(self.english)
         layout.addWidget(self.details)
         self.english.hide()
+        self.set_reading_mode("chinese")
         self.render()
+
+    def set_reading_mode(self, mode: str) -> None:
+        if mode not in READING_MODES:
+            raise ValueError("未知的课堂阅读模式。")
+        self.reading_mode = mode
+        self.body_layout.removeWidget(self.english)
+        if mode == "chinese":
+            self.body_layout.insertWidget(2, self.english)
+            self.english.hide()
+            self.chinese.setStyleSheet("font-size:18px;font-weight:500;line-height:1.6;")
+            self.english.setStyleSheet(f"font-size:14px;color:{COLORS['muted']};line-height:1.5;")
+        else:
+            self.body_layout.insertWidget(1, self.english)
+            self.english.show()
+            if mode == "english":
+                self.english.setStyleSheet(f"font-size:18px;color:{COLORS['text']};font-weight:500;line-height:1.6;")
+                self.chinese.setStyleSheet(f"font-size:14px;color:{COLORS['muted']};line-height:1.5;")
+            else:
+                self.english.setStyleSheet(f"font-size:16px;color:{COLORS['muted']};line-height:1.5;")
+                self.chinese.setStyleSheet("font-size:18px;font-weight:500;line-height:1.6;")
+        self.english_button.setText("显示英文" if self.english.isHidden() else "隐藏英文")
 
     def add_segment(self, segment: Segment) -> None:
         if any(item.id == segment.id for item in self.segments):
@@ -1093,6 +1123,8 @@ class LivePage(Page):
         self.course_context = CourseContext()
         self.paused = False
         self.elapsed = 0
+        saved_reading_mode = os.getenv("CLASSNOTE_READING_MODE", "chinese").strip().lower()
+        self.reading_mode = saved_reading_mode if saved_reading_mode in READING_MODES else "chinese"
         self.devices: list[AudioDevice] = []
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -1343,6 +1375,12 @@ class LivePage(Page):
         self.stop_button.setObjectName("Danger")
         self.stop_button.setToolTip("首次点击只会请求确认；4 秒内再次点击才会结束课堂")
         self.stop_button.setEnabled(False)
+        self.reading_choice = QComboBox()
+        self.reading_choice.setToolTip("切换课堂字幕与历史段落的阅读方式；选择会保存在本机")
+        for value, label in READING_MODES.items():
+            self.reading_choice.addItem(label, value)
+        self.reading_choice.setCurrentIndex(list(READING_MODES).index(self.reading_mode))
+        self.reading_choice.currentIndexChanged.connect(self._reading_choice_changed)
         self.review_button = QPushButton("回顾刚才")
         self.review_button.setToolTip("查看最近 30 秒、1 分钟或 2 分钟的已保存内容；录音不会暂停")
         self.review_button.clicked.connect(self.toggle_quick_review)
@@ -1379,6 +1417,7 @@ class LivePage(Page):
         control_layout.addWidget(self.material_toggle)
         control_layout.addWidget(self.fullscreen_button)
         control_layout.addWidget(self.review_button)
+        control_layout.addWidget(self.reading_choice)
         control_layout.addWidget(self.important_button)
         control_layout.addWidget(self.question_button)
         control_layout.addStretch()
@@ -1387,7 +1426,32 @@ class LivePage(Page):
         control_layout.addStretch()
         controls.hide()
         self.layout.addWidget(controls)
+        self._apply_reading_mode()
         self.refresh_devices()
+
+    def _reading_choice_changed(self, index: int) -> None:
+        mode = self.reading_choice.itemData(index)
+        if mode not in READING_MODES:
+            return
+        self.reading_mode = mode
+        self._apply_reading_mode()
+        try:
+            save_env_settings({"CLASSNOTE_READING_MODE": mode})
+        except Exception as exc:
+            self.notice.show_notice(f"阅读模式已切换，但未能记住选择：{friendly_error(exc)}", error=False)
+
+    def _apply_reading_mode(self) -> None:
+        if self.reading_mode == "english":
+            self.partial.setStyleSheet(f"color:{COLORS['text']};font-size:20px;font-weight:550;line-height:1.6;")
+            self.current_translation.setStyleSheet(f"color:{COLORS['muted']};font-size:16px;line-height:1.5;")
+        elif self.reading_mode == "bilingual":
+            self.partial.setStyleSheet(f"color:{COLORS['text']};font-size:18px;line-height:1.55;")
+            self.current_translation.setStyleSheet(f"color:{COLORS['text']};font-size:18px;line-height:1.55;")
+        else:
+            self.partial.setStyleSheet(f"color:{COLORS['muted']};font-size:16px;line-height:1.5;")
+            self.current_translation.setStyleSheet(f"color:{COLORS['text']};font-size:20px;font-weight:550;line-height:1.6;")
+        for card in self.paragraph_cards:
+            card.set_reading_mode(self.reading_mode)
 
     def on_materials_changed(self, available: bool, count: int) -> None:
         if available:
@@ -1901,6 +1965,7 @@ class LivePage(Page):
             self.paragraph_cards[-1].segments, segment
         ):
             card = ParagraphCard(segment)
+            card.set_reading_mode(self.reading_mode)
             card.retry_requested.connect(self.retry_translation)
             self.paragraph_cards.append(card)
             self.cards_layout.insertWidget(max(0, self.cards_layout.count() - 1), card)

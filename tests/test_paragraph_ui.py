@@ -63,6 +63,29 @@ def test_paragraph_card_is_chinese_first_and_english_can_be_revealed() -> None:
     app.processEvents()
 
 
+def test_paragraph_card_reading_modes_change_order_and_emphasis() -> None:
+    app = QApplication.instance() or QApplication([])
+    card = ParagraphCard(Segment("English first.", "中文第一。", 0, 1000))
+    assert card.body_layout.itemAt(1).widget() is card.chinese
+    assert card.english.isHidden()
+
+    card.set_reading_mode("bilingual")
+    assert card.body_layout.itemAt(1).widget() is card.english
+    assert not card.english.isHidden()
+    assert "font-size:16px" in card.english.styleSheet()
+
+    card.set_reading_mode("english")
+    assert "font-size:18px" in card.english.styleSheet()
+    assert "font-size:14px" in card.chinese.styleSheet()
+
+    card.set_reading_mode("chinese")
+    assert card.body_layout.itemAt(1).widget() is card.chinese
+    assert card.english.isHidden()
+    card.close()
+    card.deleteLater()
+    app.processEvents()
+
+
 def test_recent_review_keeps_a_bounded_two_minute_chinese_window() -> None:
     app = QApplication.instance() or QApplication([])
     review = RecentReviewPane()

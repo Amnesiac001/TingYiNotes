@@ -248,6 +248,34 @@ def test_quick_review_tracks_new_subtitles_without_stopping_the_session() -> Non
     application.processEvents()
 
 
+def test_reading_choice_updates_existing_and_new_cards_and_remembers_choice(monkeypatch) -> None:
+    application = app()
+    monkeypatch.setenv("CLASSNOTE_READING_MODE", "chinese")
+    saved: list[dict[str, str]] = []
+    monkeypatch.setattr("classnote.qt_gui.save_env_settings", lambda values: saved.append(values))
+    window = MainWindow()
+    live = window.live_page
+    first = Segment("First English.", "第一句中文。", 0, 1000)
+    live.add_segment(first, pending=True)
+    first_card = live.transcript_cards[first.id]
+    assert first_card.english.isHidden()
+
+    live.reading_choice.setCurrentIndex(2)
+    assert live.reading_mode == "english"
+    assert saved == [{"CLASSNOTE_READING_MODE": "english"}]
+    assert not first_card.english.isHidden()
+    assert "font-size:20px" in live.partial.styleSheet()
+
+    second = Segment("Second English.", "第二句中文。", 2000, 3000)
+    live.add_segment(second, pending=True)
+    assert live.transcript_cards[second.id].reading_mode == "english"
+    live.reading_choice.setCurrentIndex(0)
+    assert first_card.english.isHidden()
+    assert live.transcript_cards[second.id].english.isHidden()
+    window.close()
+    application.processEvents()
+
+
 def test_new_subtitles_do_not_steal_scroll_when_user_reads_older_content() -> None:
     application = app()
     window = MainWindow()
