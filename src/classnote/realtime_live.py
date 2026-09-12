@@ -339,7 +339,7 @@ class RealtimeLiveCourseSession:
                 self.result.organized_original_text,
                 self.result.organized_translated_text,
             )
-            self.repository.finalize_course(self.result.id, self.result.notes_markdown)
+            self.repository.save_notes_draft(self.result.id, self.result.notes_markdown)
             path: Path = export_markdown(self.result, self.settings.export_dir).resolve()
             self.repository.finalize_course(
                 self.result.id, self.result.notes_markdown, str(path)

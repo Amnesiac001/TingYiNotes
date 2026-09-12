@@ -40,6 +40,24 @@ def test_repository_incrementally_saves_live_course(tmp_path: Path) -> None:
     assert saved_segment["original_text"] == "Live text"
 
 
+def test_organized_notes_remain_in_progress_until_export_finishes(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "draft.db")
+    result = CourseResult("课堂", "网络", "mic", [], "")
+    repository.create_course(result)
+    repository.set_course_state(result.id, "organizing")
+
+    repository.save_notes_draft(result.id, "# 已整理但尚未导出")
+    draft = repository.get_course(result.id)
+    assert draft["notes_markdown"] == "# 已整理但尚未导出"
+    assert draft["status"] == "organizing"
+    assert draft["export_path"] == ""
+
+    repository.finalize_course(result.id, str(draft["notes_markdown"]), "notes.md")
+    complete = repository.get_course(result.id)
+    assert complete["status"] == "completed"
+    assert complete["export_path"] == "notes.md"
+
+
 def test_repository_saves_english_before_translation_and_updates_it(tmp_path: Path) -> None:
     repository = CourseRepository(tmp_path / "pending.db")
     result = CourseResult("实时课", "网络", "microphone:test", [], "")

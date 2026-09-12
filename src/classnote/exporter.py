@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from pathlib import Path
 
 from .marked_context import build_marked_contexts, marked_contexts_markdown
@@ -45,7 +47,29 @@ def export_markdown(result: CourseResult, export_dir: Path) -> Path:
         f"{marked_section}"
         f"## 英中对照记录\n\n{transcript}\n"
     )
-    path.write_text(content, encoding="utf-8")
+    # A failed recovery/export must never truncate the previous readable note.
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=export_dir,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     return path
 
 

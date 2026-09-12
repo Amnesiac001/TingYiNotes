@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+import classnote.recovery as recovery
 from classnote.config import Settings
 from classnote.models import CourseResult, Segment
 from classnote.recovery import recover_course
@@ -40,3 +43,31 @@ def test_recover_course_translates_pending_rebuilds_notes_and_exports(
     assert recovered.notes_markdown.startswith("# 待恢复课堂")
     assert repository.pending_segments(result.id) == []
     assert repository.get_course(result.id)["status"] == "completed"
+
+
+def test_recovery_export_failure_keeps_draft_and_requires_attention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLASSNOTE_EXPORT_DIR", str(tmp_path / "exports"))
+    repository = CourseRepository(tmp_path / "recovery-failure.db")
+    result = CourseResult("待恢复课堂", "网络", "mic", [], "")
+    repository.create_course(result)
+    repository.add_segment(result.id, Segment("First", "第一", 0, 1000), 0, "completed")
+    repository.set_course_state(result.id, "interrupted")
+
+    def fail_export(*args: object) -> Path:
+        raise OSError("磁盘不可写")
+
+    monkeypatch.setattr(recovery, "export_markdown", fail_export)
+    with pytest.raises(OSError, match="磁盘不可写"):
+        recover_course(
+            result.id,
+            repository,
+            settings=Settings.load(),
+            text_processor=RecoveryProcessor(),
+        )
+
+    saved = repository.get_course(result.id)
+    assert saved["status"] == "needs_attention"
+    assert saved["notes_markdown"].startswith("# 待恢复课堂")
+    assert saved["export_path"] == ""

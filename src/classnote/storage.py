@@ -325,6 +325,14 @@ class CourseRepository:
                 (notes_markdown, utc_now(), export_path, export_path, course_id),
             )
 
+    def save_notes_draft(self, course_id: str, notes_markdown: str) -> None:
+        """Keep organized notes recoverable until their file export succeeds."""
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE courses SET notes_markdown = ?, updated_at = ? WHERE id = ?",
+                (notes_markdown, utc_now(), course_id),
+            )
+
     def count_courses(self) -> int:
         with self.connect() as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM courses").fetchone()

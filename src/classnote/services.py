@@ -560,7 +560,7 @@ class CoursePipeline:
                 result.organized_original_text,
                 result.organized_translated_text,
             )
-            repository.finalize_course(result.id, result.notes_markdown)
+            repository.save_notes_draft(result.id, result.notes_markdown)
             self.progress("处理完成，正在保存……")
             return result
         except Exception as exc:

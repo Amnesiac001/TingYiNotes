@@ -57,7 +57,9 @@ def test_incremental_pipeline_persists_each_translation_with_its_segment(tmp_pat
 
     assert [row["translated_text"] for row in rows] == ["第一句。", "第二句。"]
     assert [row["translation_status"] for row in rows] == ["completed", "completed"]
-    assert repository.get_course(result.id)["status"] == "completed"
+    course = repository.get_course(result.id)
+    assert course["status"] == "organizing"
+    assert course["notes_markdown"] == result.notes_markdown
 
 
 class PartlyFailingProcessor(PerSegmentProcessor):
