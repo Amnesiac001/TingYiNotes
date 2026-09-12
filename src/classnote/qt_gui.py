@@ -751,6 +751,62 @@ class MaterialsPane(QFrame):
             show_message(self, QMessageBox.Icon.Critical, "无法打开课件", "系统没有找到可用于打开该课件的应用。")
 
 
+class TopicTimelinePane(QFrame):
+    topic_selected = Signal(int)
+    MIN_TOPIC_MS = 90_000
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("ContextPane")
+        self.entries: list[tuple[int, str]] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 16, 12, 16)
+        layout.setSpacing(10)
+        title = QLabel("课堂脉络")
+        title.setObjectName("PaneTitle")
+        self.hint = QLabel("主题会随课堂进行逐渐出现；点击可回看当时记录。")
+        self.hint.setWordWrap(True)
+        self.hint.setObjectName("Muted")
+        self.list = QListWidget()
+        self.list.setStyleSheet(
+            "QListWidget{background:transparent;border:none;padding:0;}"
+            "QListWidget::item{padding:9px 7px;margin:2px 0;border-radius:4px;}"
+            "QListWidget::item:selected{background:#EEF3FA;color:#285792;}"
+        )
+        self.list.itemClicked.connect(self._select_item)
+        layout.addWidget(title)
+        layout.addWidget(self.hint)
+        layout.addWidget(self.list, 1)
+
+    def add_topic(self, start_ms: int, title: str) -> bool:
+        title = " ".join(title.split())[:80]
+        if not title:
+            return False
+        start_ms = max(0, int(start_ms))
+        if self.entries:
+            previous_ms, previous_title = self.entries[-1]
+            if title.casefold() == previous_title.casefold():
+                return False
+            if start_ms - previous_ms < self.MIN_TOPIC_MS:
+                return False
+        self.entries.append((start_ms, title))
+        item = QListWidgetItem(f"{format_duration(start_ms)}  {title}")
+        item.setData(Qt.ItemDataRole.UserRole, start_ms)
+        item.setToolTip(f"跳转到 {format_duration(start_ms)} 附近的课堂记录")
+        self.list.addItem(item)
+        self.list.setCurrentItem(item)
+        self.hint.setText(f"已记录 {len(self.entries)} 个主题 · 点击回看")
+        return True
+
+    def reset(self) -> None:
+        self.entries.clear()
+        self.list.clear()
+        self.hint.setText("主题会随课堂进行逐渐出现；点击可回看当时记录。")
+
+    def _select_item(self, item: QListWidgetItem) -> None:
+        self.topic_selected.emit(int(item.data(Qt.ItemDataRole.UserRole)))
+
+
 class SummaryPane(QFrame):
     def __init__(self) -> None:
         super().__init__()
@@ -1036,6 +1092,8 @@ class LivePage(Page):
         self.workspace = workspace
         workspace.setChildrenCollapsible(True)
         workspace.setHandleWidth(6)
+        self.timeline = TopicTimelinePane()
+        self.timeline.topic_selected.connect(self.jump_to_topic)
         self.materials = MaterialsPane()
         self.materials.materials_changed.connect(self.on_materials_changed)
 
@@ -1122,13 +1180,16 @@ class LivePage(Page):
         center_layout.addWidget(scroll, 1)
 
         self.summary = SummaryPane()
+        workspace.addWidget(self.timeline)
         workspace.addWidget(self.materials)
         workspace.addWidget(center)
         workspace.addWidget(self.summary)
         workspace.setStretchFactor(0, 0)
-        workspace.setStretchFactor(1, 1)
-        workspace.setStretchFactor(2, 0)
-        workspace.setSizes([0, 820, 300])
+        workspace.setStretchFactor(1, 0)
+        workspace.setStretchFactor(2, 1)
+        workspace.setStretchFactor(3, 0)
+        workspace.setSizes([0, 0, 820, 300])
+        self.timeline.hide()
         self.materials.hide()
         self.layout.addWidget(workspace, 1)
         workspace.hide()
@@ -1147,7 +1208,7 @@ class LivePage(Page):
         self.stop_button.setToolTip("首次点击只会请求确认；4 秒内再次点击才会结束课堂")
         self.stop_button.setEnabled(False)
         self.material_toggle = QPushButton("课件")
-        self.material_toggle.setToolTip("显示或隐藏已导入的课件栏")
+        self.material_toggle.setToolTip("在课堂脉络与已导入课件之间切换")
         self.material_toggle.clicked.connect(self.toggle_materials)
         self.material_toggle.hide()
         self.fullscreen_button = QPushButton("全屏")
@@ -1234,23 +1295,39 @@ class LivePage(Page):
         if not self.materials.has_materials:
             self.materials.choose_files()
             return
-        self.set_materials_visible(not self.materials.isVisible())
+        self.set_materials_visible(self.materials.isHidden())
 
     def set_materials_visible(self, visible: bool) -> None:
         visible = bool(visible and self.materials.has_materials)
+        self.timeline.setVisible(not visible and self.session is not None)
         self.materials.setVisible(visible)
-        self.material_toggle.setText("隐藏课件" if visible else "显示课件")
-        if visible:
+        self.material_toggle.setText(
+            "课堂脉络" if visible and self.session is not None
+            else "隐藏课件" if visible else "查看课件"
+        )
+        if visible or self.timeline.isVisible():
             total = max(980, self.workspace.width())
-            materials_width = max(210, min(290, int(total * 0.21)))
+            context_width = max(210, min(290, int(total * 0.21)))
             summary_width = max(270, min(340, int(total * 0.24)))
             self.workspace.setSizes(
-                [materials_width, max(500, total - materials_width - summary_width), summary_width]
+                [context_width if self.timeline.isVisible() else 0,
+                 context_width if visible else 0,
+                 max(500, total - context_width - summary_width), summary_width]
             )
         else:
             total = max(900, self.workspace.width())
             summary_width = max(280, min(360, int(total * 0.27)))
-            self.workspace.setSizes([0, max(560, total - summary_width), summary_width])
+            self.workspace.setSizes([0, 0, max(560, total - summary_width), summary_width])
+
+    def jump_to_topic(self, start_ms: int) -> None:
+        if not self.paragraph_cards:
+            return
+        target = next(
+            (card for card in self.paragraph_cards if card.segments[-1].end_ms >= start_ms),
+            self.paragraph_cards[-1],
+        )
+        self.auto_follow = False
+        self.scroll.ensureWidgetVisible(target, 0, 8)
 
     def set_fullscreen_state(self, fullscreen: bool) -> None:
         self.fullscreen_button.setText("退出全屏  Esc" if fullscreen else "进入全屏")
@@ -1458,6 +1535,7 @@ class LivePage(Page):
             self.preparation_host.hide()
             self.begin_quality_monitoring(selected_device, current_settings.live_mode)
             self.workspace.show()
+            self.set_materials_visible(False)
             self.controls.show()
             self.set_immersive(True)
             self.fullscreen_button.show()
@@ -1553,6 +1631,21 @@ class LivePage(Page):
             if isinstance(payload, LiveSummarySnapshot):
                 self.summary.apply_snapshot(payload)
                 self.recent_review.set_topic(payload.topic)
+                if payload.topic and self.paragraph_cards:
+                    start_ms = self.paragraph_cards[-1].segments[-1].start_ms
+                    if not self.timeline.entries:
+                        start_ms = self.paragraph_cards[0].segments[0].start_ms
+                    if self.timeline.add_topic(start_ms, payload.topic):
+                        result = getattr(self.session, "result", None)
+                        if result is not None:
+                            try:
+                                CourseRepository(Settings.load().database_path).add_course_topic(
+                                    result.id, start_ms, payload.topic
+                                )
+                            except Exception as exc:
+                                self.notice.show_notice(
+                                    f"课堂主题未能保存：{friendly_error(exc)}", error=False
+                                )
         elif name == "summary_status":
             self.summary.set_status(payload)
         elif name == "capture_started":
@@ -1739,6 +1832,7 @@ class LivePage(Page):
         self.new_items_button.hide()
 
     def clear_session_content(self) -> None:
+        self.timeline.reset()
         self.transcript_cards.clear()
         self.paragraph_cards.clear()
         self.latest_segment_id = ""
@@ -1779,6 +1873,7 @@ class LivePage(Page):
         self.preparation_host.show()
         self.quality_strip.hide()
         self.workspace.hide()
+        self.timeline.hide()
         self.controls.hide()
         self.fullscreen_button.hide()
         if not self.materials.has_materials:
@@ -2105,6 +2200,11 @@ class LibraryPage(Page):
             for item in saved_segments
         ]
         notes = str(row["notes_markdown"] or "").strip()
+        topics = self.repository.get_course_topics(str(row["id"]))
+        topics_section = "\n".join(
+            f"- {format_duration(int(topic['start_ms']))}　{str(topic['title'])}"
+            for topic in topics
+        ) or "> 本节课尚未生成课堂主题。"
         status = COURSE_STATUS_LABELS.get(str(row["status"]), str(row["status"]))
         pending_count = int(row["pending_count"])
         lifecycle = f"状态：{status} · {row['segment_count']} 句 · {format_duration(int(row['duration_ms']))}"
@@ -2141,6 +2241,7 @@ class LibraryPage(Page):
         self.preview.setMarkdown(
             f"# {row['title']}\n\n"
             f"{row['subject']} · {lifecycle}{issue}\n\n"
+            f"---\n\n## 课堂脉络\n\n{topics_section}\n\n"
             f"---\n\n## 整理笔记\n\n{notes_section}\n\n"
             f"---\n\n## 英中对照逐字稿\n\n{transcript_section}"
         )

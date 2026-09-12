@@ -164,3 +164,20 @@ def test_repository_searches_transcript_and_reports_pending(tmp_path: Path) -> N
     assert len(rows) == 1
     assert rows[0]["pending_count"] == 1
     assert rows[0]["duration_ms"] == 2500
+
+
+def test_course_topics_survive_reload_and_follow_course_deletion(tmp_path: Path) -> None:
+    path = tmp_path / "topics.db"
+    repository = CourseRepository(path)
+    result = CourseResult("课堂", "网络", "mic", [], "")
+    repository.create_course(result)
+    repository.add_course_topic(result.id, 0, " TCP   基础 ")
+    repository.add_course_topic(result.id, 125_000, "慢启动")
+
+    reopened = CourseRepository(path)
+    rows = reopened.get_course_topics(result.id)
+    assert [(row["start_ms"], row["title"]) for row in rows] == [
+        (0, "TCP 基础"), (125_000, "慢启动")
+    ]
+    assert reopened.delete_course(result.id)
+    assert reopened.get_course_topics(result.id) == []

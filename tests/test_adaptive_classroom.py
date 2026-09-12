@@ -11,7 +11,10 @@ from PySide6.QtWidgets import QApplication
 
 from classnote.config import Settings
 from classnote.models import Segment
-from classnote.qt_gui import MainWindow, MaterialsPane, SettingsPage
+from classnote.qt_gui import MainWindow, MaterialsPane, SettingsPage, TopicTimelinePane
+from classnote.live_summary import LiveSummarySnapshot
+from classnote.models import CourseResult
+from classnote.storage import CourseRepository
 
 
 def app() -> QApplication:
@@ -80,6 +83,81 @@ def test_live_workspace_only_shows_material_column_when_needed() -> None:
     application.processEvents()
     assert live.materials.isHidden()
     window.close()
+
+
+def test_timeline_deduplicates_short_updates_and_emits_selected_time() -> None:
+    application = app()
+    timeline = TopicTimelinePane()
+    selected: list[int] = []
+    timeline.topic_selected.connect(selected.append)
+
+    assert timeline.add_topic(0, "TCP 基础")
+    assert not timeline.add_topic(30_000, "TCP 基础")
+    assert not timeline.add_topic(60_000, "慢启动")
+    assert timeline.add_topic(120_000, "慢启动")
+    assert len(timeline.entries) == 2
+    timeline._select_item(timeline.list.item(1))
+    assert selected == [120_000]
+    timeline.reset()
+    assert timeline.list.count() == 0
+    timeline.close()
+    application.processEvents()
+
+
+def test_live_timeline_switches_with_materials_and_jumps_without_autofollow() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    live.session = object()
+    live.set_materials_visible(False)
+    assert not live.timeline.isHidden()
+    assert live.materials.isHidden()
+
+    live.materials.add_paths(["D:/course/slides.pptx"])
+    assert not live.materials.isHidden()
+    assert live.timeline.isHidden()
+    live.toggle_materials()
+    assert not live.timeline.isHidden()
+    assert live.materials.isHidden()
+
+    first = Segment("TCP basics.", "TCP 基础。", 0, 1000)
+    later = Segment("Slow start.", "慢启动。", 130_000, 131_000)
+    live.add_segment(first, pending=True)
+    live.add_segment(later, pending=True)
+    live.handle_event("summary_update", LiveSummarySnapshot(topic="慢启动"))
+    assert live.timeline.entries == [(0, "慢启动")]
+    live.jump_to_topic(0)
+    assert not live.auto_follow
+    live.clear_session_content()
+    assert live.timeline.entries == []
+    live.session = None
+    window.close()
+    application.processEvents()
+
+
+def test_live_summary_topic_is_saved_for_course_library(monkeypatch, tmp_path: Path) -> None:
+    application = app()
+    database = tmp_path / "timeline.db"
+    repository = CourseRepository(database)
+    result = CourseResult("课堂", "网络", "mic", [], "")
+    repository.create_course(result)
+    monkeypatch.setenv("CLASSNOTE_DB", str(database))
+    window = MainWindow()
+    live = window.live_page
+
+    class Session:
+        def __init__(self) -> None:
+            self.result = result
+
+    live.session = Session()
+    live.add_segment(Segment("TCP basics.", "TCP 基础。", 0, 1000), pending=True)
+    live.handle_event("summary_update", LiveSummarySnapshot(topic="TCP 基础"))
+    live.handle_event("summary_update", LiveSummarySnapshot(topic="TCP 基础"))
+
+    assert len(repository.get_course_topics(result.id)) == 1
+    live.session = None
+    window.close()
+    application.processEvents()
 
 
 def test_settings_output_directory_can_be_created_and_rejects_a_file(tmp_path: Path) -> None:

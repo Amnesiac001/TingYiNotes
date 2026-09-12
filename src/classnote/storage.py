@@ -35,6 +35,15 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 CREATE INDEX IF NOT EXISTS idx_segments_course_order
 ON segments(course_id, sort_order);
+CREATE TABLE IF NOT EXISTS course_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_course_topics_order
+ON course_topics(course_id, start_ms, id);
 """
 
 
@@ -373,6 +382,24 @@ class CourseRepository:
                     (course_id,),
                 ).fetchall()
             )
+
+    def add_course_topic(self, course_id: str, start_ms: int, title: str) -> int:
+        clean_title = " ".join(title.split())[:80]
+        if not clean_title:
+            raise ValueError("课堂主题不能为空。")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO course_topics (course_id, start_ms, title) VALUES (?, ?, ?)",
+                (course_id, max(0, int(start_ms)), clean_title),
+            )
+            return int(cursor.lastrowid)
+
+    def get_course_topics(self, course_id: str) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return list(connection.execute(
+                "SELECT id, start_ms, title FROM course_topics WHERE course_id = ? ORDER BY start_ms, id",
+                (course_id,),
+            ).fetchall())
 
     def delete_course(self, course_id: str) -> bool:
         """Delete one in-app course and its segments; exported files are intentionally untouched."""
