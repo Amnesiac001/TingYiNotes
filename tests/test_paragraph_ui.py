@@ -5,7 +5,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from classnote.models import Segment
-from classnote.qt_gui import ParagraphCard, RecentReviewPane
+from classnote.qt_gui import ParagraphCard, QuickReviewPane, RecentReviewPane
 
 
 def test_paragraph_card_grows_and_updates_one_sentence_translation() -> None:
@@ -80,6 +80,50 @@ def test_recent_review_keeps_a_bounded_two_minute_chinese_window() -> None:
     review.reset()
     assert review.title.text() == "最近几分钟"
     assert review.meta.text() == "等待稳定中文"
+    review.close()
+    review.deleteLater()
+    app.processEvents()
+
+
+def test_quick_review_switches_ranges_and_can_reveal_original() -> None:
+    app = QApplication.instance() or QApplication([])
+    review = QuickReviewPane()
+    old = Segment("Older English.", "更早的内容。", 0, 1000)
+    middle = Segment("Middle English.", "中间的内容。", 80_000, 81_000)
+    recent = Segment("Recent English.", "刚刚讲的内容。", 130_000, 131_000)
+    review.set_segments([old, middle, recent])
+    review.set_topic("TCP 窗口")
+
+    assert "刚刚讲的内容" in review.body.text()
+    assert "中间的内容" in review.body.text()
+    assert "更早的内容" not in review.body.text()
+    review.range_choice.setCurrentIndex(0)
+    assert "中间的内容" not in review.body.text()
+    review.toggle_english()
+    assert not review.english.isHidden()
+    assert "Recent English" in review.english.text()
+
+    jumps: list[int] = []
+    review.jump_requested.connect(jumps.append)
+    review._request_jump()
+    assert jumps == [130_000]
+    review.reset()
+    assert review.jump_button.isEnabled() is False
+    assert review.english.isHidden()
+    review.close()
+    review.deleteLater()
+    app.processEvents()
+
+
+def test_quick_review_shows_saved_english_while_translation_is_pending() -> None:
+    app = QApplication.instance() or QApplication([])
+    review = QuickReviewPane()
+    review.set_segments([Segment("English is safe.", "", 0, 1000)])
+    assert "[待翻译] English is safe." in review.body.text()
+    closed: list[bool] = []
+    review.close_requested.connect(lambda: closed.append(True))
+    review.close_button.click()
+    assert closed == [True]
     review.close()
     review.deleteLater()
     app.processEvents()

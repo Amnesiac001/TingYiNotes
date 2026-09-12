@@ -220,6 +220,34 @@ def test_live_translation_never_replaces_current_text_with_an_older_sentence() -
     application.processEvents()
 
 
+def test_quick_review_tracks_new_subtitles_without_stopping_the_session() -> None:
+    application = app()
+    window = MainWindow()
+    live = window.live_page
+    session = object()
+    live.session = session
+    first = Segment("First.", "第一句。", 0, 1000)
+    live.add_segment(first, pending=True)
+
+    live.toggle_quick_review()
+    assert not live.quick_review.isHidden()
+    assert live.recent_review.isHidden()
+    assert "第一句" in live.quick_review.body.text()
+    later = Segment("Later.", "", 2000, 3000)
+    live.add_segment(later, pending=True)
+    assert "[待翻译] Later." in live.quick_review.body.text()
+    live.update_translation(later.id, "第二句。")
+    assert "第二句" in live.quick_review.body.text()
+    assert live.session is session
+
+    live.close_quick_review()
+    assert live.quick_review.isHidden()
+    assert live.auto_follow
+    live.session = None
+    window.close()
+    application.processEvents()
+
+
 def test_new_subtitles_do_not_steal_scroll_when_user_reads_older_content() -> None:
     application = app()
     window = MainWindow()

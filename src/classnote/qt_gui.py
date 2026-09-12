@@ -131,6 +131,7 @@ QFrame#ContextPane {{ background: {COLORS['surface_alt']}; border: none; border-
 QFrame#AssistantPane {{ background: {COLORS['surface_alt']}; border: none; border-left: 1px solid {COLORS['border']}; }}
 QFrame#NowSpeaking {{ background: #F8FAFC; border: none; border-left: 3px solid {COLORS['primary']}; }}
 QFrame#RecentReview {{ background: {COLORS['surface_alt']}; border: 1px solid {COLORS['border']}; border-radius: 5px; }}
+QFrame#QuickReview {{ background: #F8FAFC; border: 1px solid {COLORS['border']}; border-radius: 5px; }}
 QFrame#QualityStrip {{ background: {COLORS['surface']}; border: none; border-bottom: 1px solid {COLORS['border']}; }}
 QFrame#ControlBar {{ background: {COLORS['surface']}; border: none; border-top: 1px solid {COLORS['border']}; }}
 QLabel#QualityLabel {{ color: {COLORS['muted']}; font-size: 12px; }}
@@ -672,6 +673,133 @@ class RecentReviewPane(QFrame):
         self.body.setText(" ".join(item.translated_text.strip() for item in recent))
 
 
+class QuickReviewPane(QFrame):
+    """Read recent saved subtitles without pausing or making another API call."""
+
+    jump_requested = Signal(int)
+    close_requested = Signal()
+    WINDOWS = (30_000, 60_000, 120_000)
+    MAX_SEGMENTS = 16
+    MAX_CHARS = 900
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("QuickReview")
+        self.segments: list[Segment] = []
+        self.selected: list[Segment] = []
+        self.topic = ""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 12, 15, 13)
+        layout.setSpacing(8)
+        toolbar = QHBoxLayout()
+        title = QLabel("回顾刚才")
+        title.setObjectName("PaneTitle")
+        self.range_choice = QComboBox()
+        self.range_choice.addItems(["最近 30 秒", "最近 1 分钟", "最近 2 分钟"])
+        self.range_choice.setCurrentIndex(1)
+        self.range_choice.currentIndexChanged.connect(self.refresh)
+        self.close_button = QPushButton("返回实时")
+        self.close_button.clicked.connect(lambda checked=False: self.close_requested.emit())
+        toolbar.addWidget(title)
+        toolbar.addWidget(self.range_choice)
+        toolbar.addStretch()
+        toolbar.addWidget(self.close_button)
+        self.meta = QLabel("等待课堂记录")
+        self.meta.setObjectName("Muted")
+        self.body = QLabel()
+        self.body.setWordWrap(True)
+        self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.body.setStyleSheet("font-size:15px;line-height:1.6;")
+        self.english = QLabel()
+        self.english.setWordWrap(True)
+        self.english.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.english.setStyleSheet(f"font-size:13px;line-height:1.5;color:{COLORS['muted']};")
+        self.english.hide()
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_scroll.setMaximumHeight(240)
+        content_host = QWidget()
+        content_layout = QVBoxLayout(content_host)
+        content_layout.setContentsMargins(0, 0, 5, 0)
+        content_layout.setSpacing(10)
+        content_layout.addWidget(self.body)
+        content_layout.addWidget(self.english)
+        content_layout.addStretch()
+        self.content_scroll.setWidget(content_host)
+        actions = QHBoxLayout()
+        self.english_button = QPushButton("查看英文原文")
+        self.english_button.clicked.connect(self.toggle_english)
+        self.jump_button = QPushButton("跳到完整记录")
+        self.jump_button.clicked.connect(self._request_jump)
+        actions.addWidget(self.english_button)
+        actions.addWidget(self.jump_button)
+        actions.addStretch()
+        layout.addLayout(toolbar)
+        layout.addWidget(self.meta)
+        layout.addWidget(self.content_scroll)
+        layout.addLayout(actions)
+        self.refresh()
+
+    def set_segments(self, segments: list[Segment]) -> None:
+        self.segments = segments
+        self.refresh()
+
+    def set_topic(self, topic: str) -> None:
+        self.topic = " ".join(topic.split())
+        self.refresh()
+
+    def reset(self) -> None:
+        self.segments = []
+        self.topic = ""
+        self.range_choice.setCurrentIndex(1)
+        self.english.hide()
+        self.english_button.setText("查看英文原文")
+        self.refresh()
+
+    def refresh(self, *_: object) -> None:
+        self.selected = []
+        if self.segments:
+            latest_end = max(item.end_ms for item in self.segments)
+            cutoff = latest_end - self.WINDOWS[self.range_choice.currentIndex()]
+            candidates = [item for item in self.segments if item.end_ms >= cutoff]
+            characters = 0
+            for item in reversed(candidates[-self.MAX_SEGMENTS :]):
+                text = item.translated_text.strip() or item.original_text.strip()
+                if self.selected and characters + len(text) > self.MAX_CHARS:
+                    break
+                self.selected.append(item)
+                characters += len(text)
+            self.selected.reverse()
+        available = bool(self.selected)
+        self.english_button.setEnabled(available)
+        self.jump_button.setEnabled(available)
+        if not available:
+            self.meta.setText("等待课堂记录")
+            self.body.setText("还没有可回顾的稳定字幕；录音会继续进行。")
+            self.english.setText("")
+            return
+        start = format_duration(self.selected[0].start_ms)
+        end = format_duration(self.selected[-1].end_ms)
+        topic = f"当前主题：{self.topic} · " if self.topic else ""
+        self.meta.setText(f"{topic}{start}–{end} · {len(self.selected)} 句 · 已保存内容摘录")
+        self.body.setText(" ".join(
+            item.translated_text.strip() or f"[待翻译] {item.original_text.strip()}"
+            for item in self.selected
+        ))
+        self.english.setText(" ".join(item.original_text.strip() for item in self.selected))
+
+    def toggle_english(self) -> None:
+        visible = self.english.isHidden()
+        self.english.setVisible(visible)
+        self.english_button.setText("隐藏英文原文" if visible else "查看英文原文")
+
+    def _request_jump(self) -> None:
+        if self.selected:
+            self.jump_requested.emit(self.selected[0].start_ms)
+
+
 class MaterialsPane(QFrame):
     materials_changed = Signal(bool, int)
 
@@ -1127,6 +1255,10 @@ class LivePage(Page):
         now_layout.addWidget(chinese_head)
         now_layout.addWidget(self.current_translation)
         self.recent_review = RecentReviewPane()
+        self.quick_review = QuickReviewPane()
+        self.quick_review.close_requested.connect(self.close_quick_review)
+        self.quick_review.jump_requested.connect(self.jump_from_quick_review)
+        self.quick_review.hide()
         history_row = QHBoxLayout()
         history_head = QLabel("课堂记录 · 按段落整理")
         history_head.setObjectName("PaneTitle")
@@ -1176,6 +1308,7 @@ class LivePage(Page):
         scroll.setWidget(self.cards_host)
         center_layout.addWidget(self.now_speaking)
         center_layout.addWidget(self.recent_review)
+        center_layout.addWidget(self.quick_review)
         center_layout.addLayout(history_row)
         center_layout.addWidget(scroll, 1)
 
@@ -1193,6 +1326,9 @@ class LivePage(Page):
         self.materials.hide()
         self.layout.addWidget(workspace, 1)
         workspace.hide()
+        self.latest_shortcut = QShortcut(QKeySequence(Qt.Key.Key_End), workspace)
+        self.latest_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.latest_shortcut.activated.connect(self._return_to_live)
 
         controls = QFrame()
         self.controls = controls
@@ -1207,6 +1343,9 @@ class LivePage(Page):
         self.stop_button.setObjectName("Danger")
         self.stop_button.setToolTip("首次点击只会请求确认；4 秒内再次点击才会结束课堂")
         self.stop_button.setEnabled(False)
+        self.review_button = QPushButton("回顾刚才")
+        self.review_button.setToolTip("查看最近 30 秒、1 分钟或 2 分钟的已保存内容；录音不会暂停")
+        self.review_button.clicked.connect(self.toggle_quick_review)
         self.material_toggle = QPushButton("课件")
         self.material_toggle.setToolTip("在课堂脉络与已导入课件之间切换")
         self.material_toggle.clicked.connect(self.toggle_materials)
@@ -1239,6 +1378,7 @@ class LivePage(Page):
         self.stop_button.clicked.connect(self.stop)
         control_layout.addWidget(self.material_toggle)
         control_layout.addWidget(self.fullscreen_button)
+        control_layout.addWidget(self.review_button)
         control_layout.addWidget(self.important_button)
         control_layout.addWidget(self.question_button)
         control_layout.addStretch()
@@ -1328,6 +1468,36 @@ class LivePage(Page):
         )
         self.auto_follow = False
         self.scroll.ensureWidgetVisible(target, 0, 8)
+
+    def toggle_quick_review(self) -> None:
+        if self.quick_review.isHidden():
+            self.quick_review.set_segments(self._all_live_segments())
+            self.recent_review.hide()
+            self.quick_review.show()
+            self.review_button.setText("收起回顾")
+        else:
+            self.close_quick_review()
+
+    def close_quick_review(self) -> None:
+        self.quick_review.hide()
+        self.recent_review.show()
+        self.review_button.setText("回顾刚才")
+        self._scroll_to_latest()
+
+    def _return_to_live(self) -> None:
+        if self.quick_review.isHidden():
+            self._scroll_to_latest()
+        else:
+            self.close_quick_review()
+
+    def jump_from_quick_review(self, start_ms: int) -> None:
+        self.quick_review.hide()
+        self.recent_review.show()
+        self.review_button.setText("回顾刚才")
+        self.jump_to_topic(start_ms)
+
+    def _all_live_segments(self) -> list[Segment]:
+        return [item for paragraph in self.paragraph_cards for item in paragraph.segments]
 
     def set_fullscreen_state(self, fullscreen: bool) -> None:
         self.fullscreen_button.setText("退出全屏  Esc" if fullscreen else "进入全屏")
@@ -1631,6 +1801,7 @@ class LivePage(Page):
             if isinstance(payload, LiveSummarySnapshot):
                 self.summary.apply_snapshot(payload)
                 self.recent_review.set_topic(payload.topic)
+                self.quick_review.set_topic(payload.topic)
                 if payload.topic and self.paragraph_cards:
                     start_ms = self.paragraph_cards[-1].segments[-1].start_ms
                     if not self.timeline.entries:
@@ -1739,9 +1910,10 @@ class LivePage(Page):
         self.transcript_cards[segment.id] = card
         self.saved_segment_count += 1
         self.save_quality.setText(f"已保存 {self.saved_segment_count} 句")
-        self.recent_review.set_segments(
-            [item for paragraph in self.paragraph_cards for item in paragraph.segments]
-        )
+        segments = self._all_live_segments()
+        self.recent_review.set_segments(segments)
+        if not self.quick_review.isHidden():
+            self.quick_review.set_segments(segments)
         self._schedule_transcript_follow()
 
     def toggle_latest_marker(self, marker: str) -> None:
@@ -1795,9 +1967,10 @@ class LivePage(Page):
         if text and segment_id == self.latest_segment_id:
             self.current_translation.setText(text)
         if final:
-            self.recent_review.set_segments(
-                [item for paragraph in self.paragraph_cards for item in paragraph.segments]
-            )
+            segments = self._all_live_segments()
+            self.recent_review.set_segments(segments)
+            if not self.quick_review.isHidden():
+                self.quick_review.set_segments(segments)
 
     def _schedule_transcript_follow(self) -> None:
         if self.auto_follow:
@@ -1832,6 +2005,10 @@ class LivePage(Page):
         self.new_items_button.hide()
 
     def clear_session_content(self) -> None:
+        self.quick_review.hide()
+        self.quick_review.reset()
+        self.recent_review.show()
+        self.review_button.setText("回顾刚才")
         self.timeline.reset()
         self.transcript_cards.clear()
         self.paragraph_cards.clear()
@@ -1856,6 +2033,9 @@ class LivePage(Page):
         self.update_course_context_preview()
 
     def reset(self) -> None:
+        self.quick_review.hide()
+        self.recent_review.show()
+        self.review_button.setText("回顾刚才")
         self.session = None
         self.paused = False
         self.timer.stop()
