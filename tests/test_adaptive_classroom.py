@@ -407,6 +407,41 @@ def test_latest_sentence_marker_is_persisted_and_can_be_toggled() -> None:
     application.processEvents()
 
 
+def test_old_paragraph_can_be_marked_and_reopened_from_summary() -> None:
+    application = app()
+    window = MainWindow()
+    window.show()
+    calls: list[tuple[str, str]] = []
+
+    class Session:
+        def set_segment_marker(self, segment_id: str, marker: str) -> None:
+            calls.append((segment_id, marker))
+
+    live = window.live_page
+    live.session = Session()
+    old = Segment("An earlier idea.", "之前的观点。", 0, 1000)
+    latest = Segment("A new topic.", "新主题。", 5000, 6000)
+    live.add_segment(old)
+    live.add_segment(latest)
+    old_card = live.transcript_cards[old.id]
+
+    old_card.question_action.trigger()
+    assert calls == [(old.id, "question")]
+    assert old.marker == "question"
+    assert "segment:" + old.id in live.summary.markers.text()
+    assert live.question_button.text() == "? 疑问"
+
+    live.summary._marker_link_activated("segment:" + old.id)
+    assert not live.auto_follow
+    assert live.transcript_cards[old.id] is old_card
+    old_card.question_action.trigger()
+    assert calls[-1] == (old.id, "")
+    assert "segment:" + old.id not in live.summary.markers.text()
+    live.session = None
+    window.close()
+    application.processEvents()
+
+
 def test_failed_translation_can_request_an_in_class_retry() -> None:
     application = app()
     window = MainWindow()

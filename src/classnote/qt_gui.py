@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -423,6 +424,7 @@ class HomePage(Page):
 
 class ParagraphCard(QFrame):
     retry_requested = Signal(str)
+    marker_requested = Signal(str, str)
 
     def __init__(self, segment: Segment) -> None:
         super().__init__()
@@ -448,6 +450,22 @@ class ParagraphCard(QFrame):
         self.copy_button = QPushButton("复制")
         self.copy_button.setToolTip("复制本段英文和中文")
         self.copy_button.clicked.connect(self.copy_text)
+        self.mark_button = QPushButton("标记")
+        self.mark_button.setToolTip("补标这段记录；标记会落在本段最后一句并立即保存")
+        marker_menu = QMenu(self.mark_button)
+        self.important_action = marker_menu.addAction("标为重点")
+        self.question_action = marker_menu.addAction("标为疑问")
+        self.clear_marker_action = marker_menu.addAction("取消段末标记")
+        self.important_action.triggered.connect(
+            lambda checked=False: self._request_marker("important")
+        )
+        self.question_action.triggered.connect(
+            lambda checked=False: self._request_marker("question")
+        )
+        self.clear_marker_action.triggered.connect(
+            lambda checked=False: self._request_marker("")
+        )
+        self.mark_button.setMenu(marker_menu)
         self.english_button = QPushButton("显示英文")
         self.english_button.setToolTip("显示或隐藏本段英文原文")
         self.english_button.clicked.connect(self.toggle_english)
@@ -457,6 +475,7 @@ class ParagraphCard(QFrame):
         for button in (
             self.retry_button,
             self.copy_button,
+            self.mark_button,
             self.english_button,
             self.detail_button,
         ):
@@ -470,6 +489,7 @@ class ParagraphCard(QFrame):
         heading.addStretch()
         heading.addWidget(self.retry_button)
         heading.addWidget(self.copy_button)
+        heading.addWidget(self.mark_button)
         heading.addWidget(self.english_button)
         heading.addWidget(self.detail_button)
         self.english = QLabel()
@@ -549,6 +569,10 @@ class ParagraphCard(QFrame):
         if "question" in markers:
             badges.append("? 疑问")
         self.marker_badge.setText("  ·  ".join(badges))
+        tail_marker = last.marker
+        self.important_action.setText("取消段末重点" if tail_marker == "important" else "段末标为重点")
+        self.question_action.setText("取消段末疑问" if tail_marker == "question" else "段末标为疑问")
+        self.clear_marker_action.setEnabled(bool(tail_marker))
         self.english.setText(" ".join(item.original_text.strip() for item in self.segments))
         translated = [item.translated_text.strip() for item in self.segments if item.translated_text.strip()]
         waiting = any(not item.translated_text.strip() and item.id not in self.failed_ids for item in self.segments)
@@ -603,6 +627,11 @@ class ParagraphCard(QFrame):
                 segment.marker = marker
                 self.render(update_details=False)
                 return
+
+    def _request_marker(self, marker: str) -> None:
+        anchor = self.segments[-1]
+        updated = "" if anchor.marker == marker else marker
+        self.marker_requested.emit(anchor.id, updated)
 
     def set_retrying(self, segment_id: str) -> None:
         self.failed_ids.discard(segment_id)
@@ -967,6 +996,8 @@ class TopicTimelinePane(QFrame):
 
 
 class SummaryPane(QFrame):
+    marker_activated = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("AssistantPane")
@@ -995,6 +1026,11 @@ class SummaryPane(QFrame):
         self.overview = self._add_section(body, "当前主题")
         self.points_view = self._add_section(body, "关键要点")
         self.markers = self._add_section(body, "手动重点与疑问")
+        self.markers.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self.markers.linkActivated.connect(self._marker_link_activated)
         self.terms = self._add_section(body, "术语")
         self.questions = self._add_section(body, "待复习")
         body.addStretch()
@@ -1071,11 +1107,16 @@ class SummaryPane(QFrame):
             if len(content) > 220:
                 content = content[:219].rstrip() + "…"
             entries.append(
-                f"<p style='margin-bottom:12px;line-height:1.55'><b>{html.escape(context.label)}</b>"
+                f"<p style='margin-bottom:12px;line-height:1.55'>"
+                f"<a href='segment:{html.escape(context.anchor_id)}'>{html.escape(context.label)} ↗</a>"
                 f" · {format_duration(context.start_ms)}–{format_duration(context.end_ms)}<br>"
                 f"{html.escape(content)}</p>"
             )
         self.markers.setText("".join(entries))
+
+    def _marker_link_activated(self, href: str) -> None:
+        if href.startswith("segment:"):
+            self.marker_activated.emit(href.removeprefix("segment:"))
 
     def _render_terms(self) -> None:
         merged: list[str] = []
@@ -1368,6 +1409,7 @@ class LivePage(Page):
         center_layout.addWidget(scroll, 1)
 
         self.summary = SummaryPane()
+        self.summary.marker_activated.connect(self.jump_to_segment)
         workspace.addWidget(self.timeline)
         workspace.addWidget(self.materials)
         workspace.addWidget(center)
@@ -1555,6 +1597,17 @@ class LivePage(Page):
         )
         self.auto_follow = False
         self.scroll.ensureWidgetVisible(target, 0, 8)
+
+    def jump_to_segment(self, segment_id: str) -> None:
+        target = self.transcript_cards.get(segment_id)
+        if target is None:
+            return
+        if not self.quick_review.isHidden():
+            self.quick_review.hide()
+            self.recent_review.show()
+            self.review_button.setText("回顾刚才")
+        self.scroll.ensureWidgetVisible(target, 0, 8)
+        self.auto_follow = False
 
     def toggle_quick_review(self) -> None:
         if self.quick_review.isHidden():
@@ -1990,6 +2043,7 @@ class LivePage(Page):
             card = ParagraphCard(segment)
             card.set_reading_mode(self.reading_mode)
             card.retry_requested.connect(self.retry_translation)
+            card.marker_requested.connect(self.set_segment_marker)
             self.paragraph_cards.append(card)
             self.cards_layout.insertWidget(max(0, self.cards_layout.count() - 1), card)
         else:
@@ -2006,21 +2060,31 @@ class LivePage(Page):
         self._schedule_transcript_follow()
 
     def toggle_latest_marker(self, marker: str) -> None:
-        if self.session is None or not self.latest_segment_id:
+        if not self.latest_segment_id:
             return
         card = self.transcript_cards.get(self.latest_segment_id)
         if card is None:
             return
         current = card.marker_for(self.latest_segment_id)
         updated = "" if current == marker else marker
+        self.set_segment_marker(self.latest_segment_id, updated)
+
+    def set_segment_marker(self, segment_id: str, marker: str) -> None:
+        if self.session is None:
+            self.notice.show_notice("课堂已结束；请在下一节课堂中标记新记录。", error=False)
+            return
+        card = self.transcript_cards.get(segment_id)
+        if card is None:
+            return
         setter = getattr(self.session, "set_segment_marker", None)
         if not callable(setter):
             self.notice.show_notice("当前课堂模式暂不支持重点标记。", error=False)
             return
         try:
-            setter(self.latest_segment_id, updated)
-            card.set_marker(self.latest_segment_id, updated)
-            self._sync_marker_controls(updated)
+            setter(segment_id, marker)
+            card.set_marker(segment_id, marker)
+            if segment_id == self.latest_segment_id:
+                self._sync_marker_controls(marker)
             self.summary.set_marked_contexts(
                 build_marked_contexts(self._all_live_segments())
             )

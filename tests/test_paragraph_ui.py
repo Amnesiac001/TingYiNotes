@@ -86,6 +86,26 @@ def test_paragraph_card_reading_modes_change_order_and_emphasis() -> None:
     app.processEvents()
 
 
+def test_paragraph_card_can_request_a_retroactive_marker_on_its_last_sentence() -> None:
+    app = QApplication.instance() or QApplication([])
+    first = Segment("First.", "第一句。", 0, 1000)
+    last = Segment("Second.", "第二句。", 1100, 2000)
+    card = ParagraphCard(first)
+    card.add_segment(last)
+    requests: list[tuple[str, str]] = []
+    card.marker_requested.connect(lambda segment_id, marker: requests.append((segment_id, marker)))
+
+    card.important_action.trigger()
+    assert requests == [(last.id, "important")]
+    card.set_marker(last.id, "important")
+    assert card.important_action.text() == "取消段末重点"
+    card.important_action.trigger()
+    assert requests[-1] == (last.id, "")
+    card.close()
+    card.deleteLater()
+    app.processEvents()
+
+
 def test_recent_review_keeps_a_bounded_two_minute_chinese_window() -> None:
     app = QApplication.instance() or QApplication([])
     review = RecentReviewPane()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 
 from .models import Segment
@@ -28,6 +29,12 @@ def build_marked_contexts(
 ) -> list[MarkedContext]:
     """Expand each manual marker into nearby saved subtitles, without model calls."""
     ordered = sorted(segments, key=lambda item: (item.start_ms, item.end_ms))
+    starts = [item.start_ms for item in ordered]
+    prefix_max_ends: list[int] = []
+    latest_end = 0
+    for item in ordered:
+        latest_end = max(latest_end, item.end_ms)
+        prefix_max_ends.append(latest_end)
     contexts: list[MarkedContext] = []
     for index, anchor in enumerate(ordered):
         if anchor.marker not in MARKER_LABELS:
@@ -35,8 +42,10 @@ def build_marked_contexts(
         if anchor.end_ms > anchor.start_ms:
             window_start = max(0, anchor.start_ms - before_ms)
             window_end = anchor.end_ms + after_ms
+            first = bisect_left(prefix_max_ends, window_start)
+            last = bisect_right(starts, window_end)
             nearby = [
-                item for item in ordered
+                item for item in ordered[first:last]
                 if item.end_ms > item.start_ms
                 and item.end_ms >= window_start
                 and item.start_ms <= window_end

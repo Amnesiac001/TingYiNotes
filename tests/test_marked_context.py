@@ -38,3 +38,13 @@ def test_untimed_legacy_segments_use_neighbouring_sequence() -> None:
     context = build_marked_contexts(segments)[0]
 
     assert context.english == "Sentence 2 Sentence 3 Sentence 4 Sentence 5 Sentence 6"
+
+
+def test_context_window_handles_unsorted_overlapping_segments() -> None:
+    anchor = Segment("Anchor.", "标记。", 30_000, 31_000, marker="important")
+    overlap = Segment("Long explanation.", "长解释。", 5000, 15_000)
+    outside = Segment("Outside.", "外部。", 1000, 2000)
+
+    context = build_marked_contexts([anchor, outside, overlap])[0]
+
+    assert context.english == "Long explanation. Anchor."
