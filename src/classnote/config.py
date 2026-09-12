@@ -40,6 +40,7 @@ class Settings:
     text_provider: str
     text_api_key: str | None
     text_base_url: str | None
+    temporary_audio: bool
 
     @classmethod
     def load(cls) -> "Settings":
@@ -80,6 +81,8 @@ class Settings:
             text_provider=provider,
             text_api_key=text_key,
             text_base_url=text_base_url,
+            temporary_audio=os.getenv("CLASSNOTE_TEMP_AUDIO", "false").strip().lower()
+            in {"1", "true", "yes", "on"},
         )
 
     def ensure_directories(self) -> None:

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import Settings
+from .courseware import relevant_terms
 from .exporter import export_markdown
 from .models import CourseResult, Segment
 from .services import TextProcessor, create_text_processor
@@ -37,6 +38,7 @@ def recover_course(
         current_settings.text_base_url,
     )
     pending = repository.pending_segments(course_id)
+    remembered_terms = repository.get_subject_terms(str(row["subject"]))
     repository.set_course_state(course_id, "translating")
     failures: list[str] = []
     for index, item in enumerate(pending, start=1):
@@ -45,7 +47,8 @@ def recover_course(
         repository.set_translation_state(segment_id, "translating")
         try:
             translated = processor.translate(
-                str(item["original_text"]), str(row["subject"]), {}
+                str(item["original_text"]), str(row["subject"]),
+                relevant_terms(str(item["original_text"]), remembered_terms),
             ).strip()
             if not translated:
                 raise RuntimeError("翻译服务没有返回内容。")

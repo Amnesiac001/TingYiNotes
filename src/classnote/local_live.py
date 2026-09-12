@@ -19,6 +19,7 @@ from .live_summary import LiveSummaryCoordinator
 from .models import CourseResult
 from .services import create_text_processor
 from .storage import CourseRepository
+from .temporary_audio import finish_temporary_audio, start_temporary_audio
 
 
 LiveEvent = Callable[[str, object], None]
@@ -182,9 +183,15 @@ class LocalLiveCourseSession:
         self.dropped_blocks = 0
         self._last_buffer_report_second = -1
         self.finalized = False
+        self.temporary_audio = None
 
     def start(self) -> None:
         self.repository.create_course(self.result)
+        if self.settings.temporary_audio:
+            self.temporary_audio = start_temporary_audio(
+                self.settings.database_path, self.result.id, self.SAMPLE_RATE,
+                lambda message: self.event("warning", message),
+            )
         self.live_summary.start()
         self.translations.start()
         self.started_monotonic = time.monotonic()
@@ -245,6 +252,9 @@ class LocalLiveCourseSession:
         if self.stop_event.is_set() or self.pause_event.is_set():
             return
         pcm = bytes(indata)
+        backup = getattr(self, "temporary_audio", None)
+        if backup is not None:
+            backup.submit(pcm)
         captured_end_ms = self._elapsed_ms()
         try:
             self.audio_queue.put_nowait((pcm, captured_end_ms))
@@ -346,8 +356,14 @@ class LocalLiveCourseSession:
                 self.stream = None
             self.translations.close_and_wait(timeout=45)
             self.live_summary.close(timeout=2)
-            if self.ready_event.is_set():
-                self._finalize()
+            try:
+                if self.ready_event.is_set():
+                    self._finalize()
+            finally:
+                finish_temporary_audio(
+                    getattr(self, "temporary_audio", None), self.repository, self.result.id,
+                    lambda message: self.event("warning", message),
+                )
 
     def _create_capture_stream(self) -> ResamplingRawInputStream | LoopbackPCMStream:
         if bool(getattr(self.device, "is_loopback", False)):

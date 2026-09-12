@@ -7,6 +7,7 @@ from typing import Callable, Iterator, Protocol
 
 from openai import OpenAI
 
+from .courseware import relevant_terms
 from .models import CourseResult, Segment
 
 
@@ -468,7 +469,9 @@ class CoursePipeline:
         original = "\n".join(segment.original_text for segment in segments)
 
         self.progress("正在翻译为简体中文……")
-        translation = self.text_processor.translate(original, subject, terms or {})
+        translation = self.text_processor.translate(
+            original, subject, relevant_terms(original, terms or {})
+        )
         # 文件模式有时只返回一个长段落；首版将完整译文绑定到第一段，避免错误切句。
         if segments:
             segments[0].translated_text = translation
@@ -519,7 +522,8 @@ class CoursePipeline:
             def translate_one(segment: Segment) -> tuple[Segment, str]:
                 repository.set_translation_state(segment.id, "translating")
                 translated = self.text_processor.translate(
-                    segment.original_text, subject, terms or {}
+                    segment.original_text, subject,
+                    relevant_terms(segment.original_text, terms or {}),
                 ).strip()
                 if not translated:
                     raise RuntimeError("翻译服务没有返回内容。")

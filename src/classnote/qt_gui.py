@@ -22,6 +22,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -47,13 +48,17 @@ from PySide6.QtWidgets import (
 from .app import process_course
 from .branding import APP_NAME, APP_TITLE
 from .config import Settings, save_env_settings
-from .courseware import CourseContext, build_course_context
+from .courseware import CourseContext, build_course_context, merge_subject_context
 from .live import AudioDevice, AudioLevelResult, LiveCourseSession, capture_audio_level, list_input_devices
 from .live_summary import LiveSummarySnapshot
 from .marked_context import MarkedContext, build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult, Segment
 from .paragraphs import group_segments, paragraph_time_bounds, should_start_new_paragraph
 from .recent_index import RecentSegmentIndex
+from .recovery_center import RecoveryCenterDialog
+from .recovery_inventory import list_recovery_candidates
+from .segment_editor import SegmentEditorDialog
+from .subject_terms_dialog import SubjectTermsDialog
 from .platforms import (
     IS_APPLE_SILICON,
     IS_MACOS,
@@ -238,7 +243,7 @@ def confirm_course_delete(parent: QWidget, title: str, segment_count: int) -> bo
     box.setWindowTitle("删除课程记录")
     box.setText(f"确定删除《{title}》吗？")
     box.setInformativeText(
-        f"软件内的课程和 {segment_count} 句字幕会被删除。已经导出的 Markdown 笔记文件会保留。"
+        f"软件内的课程和 {segment_count} 句字幕会被删除。已经导出的 Markdown 笔记文件会保留；若启用了临时音频，保留的 WAV 也需手动删除。"
     )
     box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
     box.button(QMessageBox.StandardButton.Yes).setText("删除记录")
@@ -342,11 +347,13 @@ class HomePage(Page):
         repository: CourseRepository,
         settings: Settings,
         open_course: Callable[[str], None],
+        open_recovery_center: Callable[[], None],
     ) -> None:
         super().__init__("最近课程")
         self.navigate = navigate
         self.repository = repository
         self.open_course = open_course
+        self.open_recovery_center = open_recovery_center
         toolbar = QHBoxLayout()
         start = QPushButton("新建课堂")
         start.setObjectName("Primary")
@@ -360,6 +367,18 @@ class HomePage(Page):
         toolbar.addStretch()
         toolbar.addWidget(self.service)
         self.layout.addLayout(toolbar)
+
+        self.recovery_card = QFrame()
+        self.recovery_card.setObjectName("Card")
+        recovery_row = QHBoxLayout(self.recovery_card)
+        recovery_row.setContentsMargins(16, 12, 16, 12)
+        self.recovery_label = QLabel()
+        self.recovery_label.setWordWrap(True)
+        recovery_button = QPushButton("打开恢复中心")
+        recovery_button.clicked.connect(self.open_recovery_center)
+        recovery_row.addWidget(self.recovery_label, 1)
+        recovery_row.addWidget(recovery_button)
+        self.layout.addWidget(self.recovery_card)
 
         recent = QFrame()
         recent.setObjectName("Card")
@@ -382,6 +401,15 @@ class HomePage(Page):
             else "未配置"
         )
         self.service.setText(f"转写：{speech}    翻译：{translation}")
+        recoverable = list_recovery_candidates(self.repository)
+        self.recovery_card.setVisible(bool(recoverable))
+        if recoverable:
+            count = len(recoverable)
+            audio_count = sum(item.audio_path is not None for item in recoverable)
+            self.recovery_label.setText(
+                f"有 {count} 项课堂内容可以继续处理"
+                + (f" · 其中 {audio_count} 项留有本机录音" if audio_count else "")
+            )
         clear_layout(self.recent_layout)
         rows = self.repository.list_courses(limit=4)
         if not rows:
@@ -1191,12 +1219,14 @@ class LivePage(Page):
         navigate: Callable[[int], None],
         set_immersive: Callable[[bool], None],
         toggle_fullscreen: Callable[[], None],
+        repository: CourseRepository,
     ) -> None:
         super().__init__("实时课堂", "低延迟英文字幕、中文翻译和自动课堂整理。")
         self.bridge = bridge
         self.navigate = navigate
         self.set_immersive = set_immersive
         self.toggle_fullscreen = toggle_fullscreen
+        self.repository = repository
         self.session: object | None = None
         self.transcript_cards: dict[str, ParagraphCard] = {}
         self.paragraph_cards: list[ParagraphCard] = []
@@ -1253,6 +1283,7 @@ class LivePage(Page):
         self.title_input.setPlaceholderText("课程名称")
         self.subject_input = QLineEdit("通用课程")
         self.subject_input.setPlaceholderText("课程领域")
+        self.subject_input.editingFinished.connect(self.update_course_context_preview)
         self.device_combo = QComboBox()
         refresh = QPushButton("刷新设备")
         refresh.setToolTip("重新读取系统中可用的录音输入设备")
@@ -1278,6 +1309,10 @@ class LivePage(Page):
         self.import_materials_button.setToolTip("导入 PDF、PPT、Word 或文本资料；未导入时不会占用课堂空间")
         self.import_materials_button.clicked.connect(lambda: self.materials.choose_files())
         material_row.addWidget(self.material_state, 1)
+        self.terms_button = QPushButton("术语管理")
+        self.terms_button.setToolTip("为当前课程领域保存中英术语，下次课堂自动使用")
+        self.terms_button.clicked.connect(self.manage_subject_terms)
+        material_row.addWidget(self.terms_button)
         material_row.addWidget(self.import_materials_button)
         info_layout.addLayout(material_row)
         self.start_button = QPushButton("开始课堂")
@@ -1597,17 +1632,29 @@ class LivePage(Page):
             self.update_course_context_preview()
 
     def update_course_context_preview(self) -> None:
-        if self.course_context.terms:
+        context = self.effective_course_context()
+        if context.terms:
             self.summary.set_reference_terms(
                 [
                     f"{english}：{chinese}"
-                    for english, chinese in list(self.course_context.terms.items())[:30]
+                    for english, chinese in list(context.terms.items())[:30]
                 ]
             )
-        elif self.course_context.hotwords:
-            self.summary.set_reference_terms(self.course_context.hotwords[:30])
+        elif context.hotwords:
+            self.summary.set_reference_terms(context.hotwords[:30])
         else:
             self.summary.set_reference_terms([])
+
+    def effective_course_context(self) -> CourseContext:
+        subject = self.subject_input.text().strip() or "通用课程"
+        return merge_subject_context(
+            self.course_context, self.repository.get_subject_terms(subject)
+        )
+
+    def manage_subject_terms(self) -> None:
+        subject = self.subject_input.text().strip() or "通用课程"
+        SubjectTermsDialog(self.repository, subject, self).exec()
+        self.update_course_context_preview()
 
     def toggle_materials(self) -> None:
         if not self.materials.has_materials:
@@ -1982,7 +2029,7 @@ class LivePage(Page):
                 self.subject_input.text().strip() or "通用课程",
                 self.devices[self.device_combo.currentIndex()],
                 lambda name, payload: self.bridge.event.emit(name, payload),
-                self.course_context,
+                self.effective_course_context(),
             )
             self.session.start()  # type: ignore[attr-defined]
             self.elapsed = 0
@@ -2520,9 +2567,10 @@ class DropZone(QFrame):
 
 
 class FilePage(Page):
-    def __init__(self, bridge: Bridge) -> None:
+    def __init__(self, bridge: Bridge, repository: CourseRepository) -> None:
         super().__init__("文件转写", "导入已有课堂录音，生成英中记录和结构化笔记。")
         self.bridge = bridge
+        self.repository = repository
         self.path = ""
         self.drop = DropZone()
         self.drop.file_dropped.connect(self.select_file)
@@ -2540,6 +2588,10 @@ class FilePage(Page):
         self.subject_input.setPlaceholderText("课程领域")
         fields.addWidget(self.title_input, 2)
         fields.addWidget(self.subject_input, 1)
+        terms_button = QPushButton("术语管理")
+        terms_button.setToolTip("管理当前课程领域的本地中英术语")
+        terms_button.clicked.connect(self.manage_subject_terms)
+        fields.addWidget(terms_button)
         self.start_button = QPushButton("开始处理")
         self.start_button.setObjectName("Primary")
         self.demo_button = QPushButton("运行离线演示")
@@ -2561,6 +2613,10 @@ class FilePage(Page):
         self.layout.addStretch()
         self.start_button.clicked.connect(lambda: self.start(False))
         self.demo_button.clicked.connect(lambda: self.start(True))
+
+    def manage_subject_terms(self) -> None:
+        subject = self.subject_input.text().strip() or "通用课程"
+        SubjectTermsDialog(self.repository, subject, self).exec()
 
     def select_file(self, path: str) -> None:
         self.path = path
@@ -2618,6 +2674,7 @@ class LibraryPage(Page):
     def __init__(self, repository: CourseRepository) -> None:
         super().__init__("课程库", "搜索并回看已经保存的课堂记录。")
         self.repository = repository
+        self._recovery_running = False
         self.rows = []
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索课程、逐字稿、翻译或笔记……")
@@ -2631,6 +2688,10 @@ class LibraryPage(Page):
         self.recover_button.setToolTip("补译失败或中断的句子，并重新生成课堂笔记")
         self.recover_button.setEnabled(False)
         self.recover_button.clicked.connect(self.recover_selected)
+        self.edit_button = QPushButton("校对字幕")
+        self.edit_button.setToolTip("逐句修改已结束课堂的英文和中文；保存后更新本地对照笔记")
+        self.edit_button.setEnabled(False)
+        self.edit_button.clicked.connect(self.edit_selected)
         self.delete_button = QPushButton("删除记录")
         self.delete_button.setObjectName("Danger")
         self.delete_button.setToolTip("删除选中的软件内课程记录；不会删除已导出的笔记文件")
@@ -2638,6 +2699,7 @@ class LibraryPage(Page):
         self.delete_button.clicked.connect(self.delete_selected)
         toolbar.addWidget(refresh)
         toolbar.addWidget(self.recover_button)
+        toolbar.addWidget(self.edit_button)
         toolbar.addWidget(self.delete_button)
         self.layout.addLayout(toolbar)
         content = QHBoxLayout()
@@ -2683,6 +2745,7 @@ class LibraryPage(Page):
         else:
             self.delete_button.setEnabled(False)
             self.recover_button.setEnabled(False)
+            self.edit_button.setEnabled(False)
             self.preview.setHtml(
                 "<div style='color:#777;padding:24px'>"
                 "<h3>没有找到课程记录</h3>"
@@ -2691,10 +2754,14 @@ class LibraryPage(Page):
 
     def selection_changed(self, index: int) -> None:
         valid = 0 <= index < len(self.rows)
-        self.delete_button.setEnabled(valid)
+        self.delete_button.setEnabled(valid and not self._recovery_running)
         recoverable = False
+        editable = False
         if valid:
             row = self.rows[index]
+            editable = int(row["segment_count"]) > 0 and str(row["status"]) not in {
+                "recording", "transcribing", "translating", "organizing"
+            }
             recoverable = int(row["segment_count"]) > 0 and (
                 int(row["pending_count"]) > 0
                 or str(row["status"]) in {"needs_attention", "interrupted", "failed"}
@@ -2702,18 +2769,23 @@ class LibraryPage(Page):
             self.recover_button.setText(
                 "补译并整理" if int(row["pending_count"]) else "重新整理"
             )
-        self.recover_button.setEnabled(recoverable)
+        self.recover_button.setEnabled(recoverable and not self._recovery_running)
+        self.edit_button.setEnabled(editable and not self._recovery_running)
         if valid:
             self.show_course(index)
 
-    def select_course(self, course_id: str) -> None:
+    def select_course(self, course_id: str) -> bool:
         self.reload()
         for index, row in enumerate(self.rows):
             if str(row["id"]) == course_id:
                 self.list.setCurrentRow(index)
-                return
+                return True
+        self.list.setCurrentRow(-1)
+        return False
 
     def delete_selected(self) -> None:
+        if self._recovery_running:
+            return
         index = self.list.currentRow()
         if not (0 <= index < len(self.rows)):
             return
@@ -2727,13 +2799,28 @@ class LibraryPage(Page):
         else:
             show_message(self, QMessageBox.Icon.Warning, "记录不存在", "这条课程记录可能已经被删除，请刷新后重试。")
 
+    def edit_selected(self) -> None:
+        index = self.list.currentRow()
+        if self._recovery_running or not (0 <= index < len(self.rows)):
+            return
+        row = self.rows[index]
+        if not self.edit_button.isEnabled():
+            return
+        course_id = str(row["id"])
+        dialog = SegmentEditorDialog(self.repository, course_id, str(row["title"]), self)
+        dialog.exec()
+        if dialog.saved_any:
+            self.select_course(course_id)
+
     def recover_selected(self) -> None:
         index = self.list.currentRow()
-        if not (0 <= index < len(self.rows)):
+        if self._recovery_running or not (0 <= index < len(self.rows)):
             return
         row = self.rows[index]
         course_id = str(row["id"])
+        self._recovery_running = True
         self.recover_button.setEnabled(False)
+        self.edit_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.preview.setMarkdown(
             f"# {row['title']}\n\n正在补译和重新整理，请不要关闭软件……"
@@ -2760,6 +2847,7 @@ class LibraryPage(Page):
         if name == "progress":
             self.preview.setMarkdown(f"# 正在处理课程\n\n{payload}")
             return
+        self._recovery_running = False
         if name == "finished":
             result, path, index = payload  # type: ignore[misc]
             self.reload(preferred_index=int(index))
@@ -2912,6 +3000,18 @@ class SettingsPage(Page):
         speech_actions.addWidget(self.speech_status, 1)
         speech_actions.addWidget(self.test_local_button)
         speech_layout.addLayout(speech_actions)
+        self.temporary_audio_check = QCheckBox("临时保留本机课堂音频（默认关闭）")
+        self.temporary_audio_check.setChecked(settings.temporary_audio)
+        self.temporary_audio_check.setToolTip(
+            "课堂进行时写入本机 WAV；正常完成并导出后自动删除，失败或中断时保留供恢复。"
+        )
+        audio_retention_hint = QLabel(
+            "仅保存在课程数据库旁的 temporary-audio 文件夹；失败或中断时不会自动删除，请注意隐私和磁盘空间。"
+        )
+        audio_retention_hint.setObjectName("Muted")
+        audio_retention_hint.setWordWrap(True)
+        speech_layout.addWidget(self.temporary_audio_check)
+        speech_layout.addWidget(audio_retention_hint)
         self.layout.addWidget(speech)
 
         text_card = QFrame()
@@ -3163,6 +3263,7 @@ class SettingsPage(Page):
             "DEEPSEEK_API_KEY": text_key if provider == "deepseek" else "",
             "TEXT_BASE_URL": base_url if provider == "compatible" else ("https://api.deepseek.com" if provider == "deepseek" else ""),
             "CLASSNOTE_EXPORT_DIR": str(output_dir),
+            "CLASSNOTE_TEMP_AUDIO": "true" if self.temporary_audio_check.isChecked() else "false",
         }
         try:
             save_env_settings(values)
@@ -3244,14 +3345,16 @@ class MainWindow(QMainWindow):
             self.repository,
             self.settings,
             self.open_course,
+            self.open_recovery_center,
         )
         self.live_page = LivePage(
             self.bridge,
             self.navigate,
             self.set_immersive,
             self.toggle_fullscreen,
+            self.repository,
         )
-        self.file_page = FilePage(self.bridge)
+        self.file_page = FilePage(self.bridge, self.repository)
         self.library_page = LibraryPage(self.repository)
         self.settings_page = SettingsPage(self.settings)
         for page in [self.home_page, self.live_page, self.file_page, self.library_page, self.settings_page]:
@@ -3272,6 +3375,23 @@ class MainWindow(QMainWindow):
     def open_course(self, course_id: str) -> None:
         self.navigate(3)
         self.library_page.select_course(course_id)
+
+    def resume_course(self, course_id: str) -> None:
+        self.navigate(3)
+        if self.library_page.select_course(course_id) and self.library_page.recover_button.isEnabled():
+            self.library_page.recover_selected()
+
+    def open_recovery_audio(self, path: Path, title: str, subject: str) -> None:
+        self.navigate(2)
+        self.file_page.select_file(str(path))
+        self.file_page.title_input.setText(title if title != "未关联的课堂录音" else "恢复的课堂录音")
+        self.file_page.subject_input.setText(subject)
+        self.file_page.status.setText("已载入保留录音。确认课程信息后点击“开始处理”，将创建一条新记录。")
+
+    def open_recovery_center(self) -> None:
+        RecoveryCenterDialog(
+            self.repository, self.resume_course, self.open_recovery_audio, self
+        ).exec()
 
     def set_immersive(self, active: bool) -> None:
         """Use a distraction-free workspace while keeping recording controls accessible."""

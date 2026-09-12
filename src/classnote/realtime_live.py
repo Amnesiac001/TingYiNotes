@@ -19,6 +19,7 @@ from .live_summary import LiveSummaryCoordinator
 from .models import CourseResult, Segment
 from .services import create_text_processor
 from .storage import CourseRepository
+from .temporary_audio import finish_temporary_audio, start_temporary_audio
 
 
 @dataclass(frozen=True)
@@ -121,9 +122,15 @@ class RealtimeLiveCourseSession:
         self.paused = False
         self.stopping = False
         self.finalized = False
+        self.temporary_audio = None
 
     def start(self) -> None:
         self.repository.create_course(self.result)
+        if self.settings.temporary_audio:
+            self.temporary_audio = start_temporary_audio(
+                self.settings.database_path, self.result.id, self.SAMPLE_RATE,
+                lambda message: self.event("warning", message),
+            )
         self.started_monotonic = time.monotonic()
         try:
             self.connection_manager = self.client.realtime.connect(
@@ -170,6 +177,10 @@ class RealtimeLiveCourseSession:
             self.live_summary.close(timeout=1)
             if not self.result.segments:
                 self.repository.delete_course(self.result.id)
+            finish_temporary_audio(
+                self.temporary_audio, self.repository, self.result.id,
+                lambda message: self.event("warning", message),
+            )
             raise
 
     def _session_update(self) -> dict[str, object]:
@@ -204,6 +215,9 @@ class RealtimeLiveCourseSession:
         if self.stop_event.is_set() or self.paused:
             return
         pcm = bytes(indata)
+        backup = getattr(self, "temporary_audio", None)
+        if backup is not None:
+            backup.submit(pcm)
         try:
             self.audio_queue.put_nowait(pcm)
         except queue.Full:
@@ -307,7 +321,13 @@ class RealtimeLiveCourseSession:
             self.receiver_thread.join(timeout=2)
         self.translations.close_and_wait(timeout=45)
         self.live_summary.close(timeout=2)
-        self._finalize()
+        try:
+            self._finalize()
+        finally:
+            finish_temporary_audio(
+                self.temporary_audio, self.repository, self.result.id,
+                lambda message: self.event("warning", message),
+            )
 
     def _stop_audio_sender(self, timeout: float) -> bool:
         """Bound both the final queue write and sender join during shutdown."""

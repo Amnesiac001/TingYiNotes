@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from .courseware import relevant_terms
 from .models import CourseResult, Segment
 from .services import TextProcessor
 from .storage import CourseRepository
@@ -241,10 +242,16 @@ class LiveTranslationCoordinator:
     def _stream_or_translate(self, segment: Segment) -> str:
         stream_method = getattr(self.text_processor, "translate_stream", None)
         if not callable(stream_method):
-            return self.text_processor.translate(segment.original_text, self.subject, self.terms).strip()
+            return self.text_processor.translate(
+                segment.original_text, self.subject,
+                relevant_terms(segment.original_text, self.terms),
+            ).strip()
         parts: list[str] = []
         last_emit = 0.0
-        for delta in stream_method(segment.original_text, self.subject, self.terms):
+        for delta in stream_method(
+            segment.original_text, self.subject,
+            relevant_terms(segment.original_text, self.terms),
+        ):
             parts.append(str(delta))
             now = time.monotonic()
             if now - last_emit >= 0.05:

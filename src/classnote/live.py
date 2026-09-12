@@ -19,12 +19,13 @@ import sounddevice as sd
 from openai import OpenAI
 
 from .config import Settings
-from .courseware import CourseContext
+from .courseware import CourseContext, relevant_terms
 from .exporter import export_markdown
 from .live_summary import LiveSummaryCoordinator
 from .models import CourseResult, Segment
 from .services import OpenAITranscriber, create_text_processor
 from .storage import CourseRepository
+from .temporary_audio import finish_temporary_audio, start_temporary_audio
 
 
 LiveEvent = Callable[[str, object], None]
@@ -432,16 +433,31 @@ class ChunkedLiveCourseSession:
             device,
             self.settings.live_chunk_seconds,
             lambda path, start, end: self.pending.put((path, start, end)),
-            self.audio_monitor.observe,
+            self._observe_audio,
         )
         self.stopping = False
+        self.temporary_audio = None
+
+    def _observe_audio(self, pcm: bytes) -> None:
+        self.audio_monitor.observe(pcm)
+        if self.temporary_audio is not None:
+            self.temporary_audio.submit(pcm)
 
     def start(self) -> None:
         self.repository.create_course(self.result)
+        if self.settings.temporary_audio:
+            self.temporary_audio = start_temporary_audio(
+                self.settings.database_path, self.result.id, self.recorder.sample_rate,
+                lambda message: self.event("warning", message),
+            )
         try:
             self.recorder.start()
         except Exception:
             self.repository.delete_course(self.result.id)
+            finish_temporary_audio(
+                self.temporary_audio, self.repository, self.result.id,
+                lambda message: self.event("warning", message),
+            )
             raise
         self.repository.set_course_state(self.result.id, "transcribing")
         self.live_summary.start()
@@ -488,7 +504,7 @@ class ChunkedLiveCourseSession:
                 if not original:
                     continue
                 translation = self.text_processor.translate(
-                    original, self.subject, self.course_context.terms
+                    original, self.subject, relevant_terms(original, self.course_context.terms)
                 )
                 segment = Segment(original, translation, start_ms, end_ms)
                 self.result.segments.append(segment)
@@ -503,7 +519,13 @@ class ChunkedLiveCourseSession:
                 except OSError:
                     pass
         self.live_summary.close(timeout=2)
-        self._finalize()
+        try:
+            self._finalize()
+        finally:
+            finish_temporary_audio(
+                self.temporary_audio, self.repository, self.result.id,
+                lambda message: self.event("warning", message),
+            )
 
     def _finalize(self) -> None:
         if not self.result.segments:

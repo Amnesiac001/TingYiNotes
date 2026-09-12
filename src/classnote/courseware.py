@@ -30,6 +30,52 @@ class CourseContext:
         return ", ".join(self.hotwords)
 
 
+def merge_subject_context(courseware: CourseContext, remembered: dict[str, str]) -> CourseContext:
+    """Add persistent subject terms without changing the imported courseware context."""
+    terms: dict[str, str] = {}
+    seen_terms: set[str] = set()
+    for source in (courseware.terms, remembered):
+        for english, chinese in source.items():
+            key = " ".join(english.split()).casefold()
+            if not key or key in seen_terms or not chinese.strip():
+                continue
+            terms[english] = chinese
+            seen_terms.add(key)
+            if len(terms) >= 80:
+                break
+        if len(terms) >= 80:
+            break
+    hotwords: list[str] = []
+    seen_hotwords: set[str] = set()
+    for value in (*terms.keys(), *courseware.hotwords):
+        key = " ".join(value.split()).casefold()
+        if not key or key in seen_hotwords:
+            continue
+        hotwords.append(value)
+        seen_hotwords.add(key)
+        if len(hotwords) >= MAX_HOTWORDS:
+            break
+    return CourseContext(
+        source_count=courseware.source_count,
+        extracted_chars=courseware.extracted_chars,
+        hotwords=tuple(hotwords),
+        terms=terms,
+        warnings=courseware.warnings,
+    )
+
+
+def relevant_terms(text: str, terms: dict[str, str], limit: int = 12) -> dict[str, str]:
+    """Send only glossary entries present in this speech segment to the translator."""
+    matches: list[tuple[int, int, str, str]] = []
+    for english, chinese in terms.items():
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(english)}(?![A-Za-z0-9])"
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            matches.append((match.start(), -len(english), english, chinese))
+    matches.sort()
+    return {english: chinese for _, _, english, chinese in matches[:max(0, limit)]}
+
+
 def build_course_context(paths: list[str]) -> CourseContext:
     texts: list[str] = []
     warnings: list[str] = []

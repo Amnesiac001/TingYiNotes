@@ -35,6 +35,16 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 CREATE INDEX IF NOT EXISTS idx_segments_course_order
 ON segments(course_id, sort_order);
+CREATE TABLE IF NOT EXISTS segment_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    segment_id TEXT NOT NULL,
+    previous_original_text TEXT NOT NULL,
+    previous_translated_text TEXT NOT NULL,
+    corrected_at TEXT NOT NULL,
+    FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_segment_corrections_latest
+ON segment_corrections(segment_id, id);
 CREATE TABLE IF NOT EXISTS course_topics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     course_id TEXT NOT NULL,
@@ -44,10 +54,23 @@ CREATE TABLE IF NOT EXISTS course_topics (
 );
 CREATE INDEX IF NOT EXISTS idx_course_topics_order
 ON course_topics(course_id, start_ms, id);
+CREATE TABLE IF NOT EXISTS subject_terms (
+    subject_key TEXT NOT NULL,
+    subject_name TEXT NOT NULL,
+    english_key TEXT NOT NULL,
+    english TEXT NOT NULL,
+    chinese TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (subject_key, english_key)
+);
+CREATE INDEX IF NOT EXISTS idx_subject_terms_subject
+ON subject_terms(subject_key, english_key);
 """
 
 
 class CourseRepository:
+    MAX_SUBJECT_TERMS = 80
+
     def __init__(self, database_path: Path):
         self.database_path = database_path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,6 +83,61 @@ class CourseRepository:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
         return connection
+
+    @staticmethod
+    def _term_key(value: str) -> str:
+        return " ".join(value.split()).casefold()
+
+    def get_subject_terms(self, subject: str) -> dict[str, str]:
+        key = self._term_key(subject)
+        if not key:
+            return {}
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT english, chinese FROM subject_terms
+                   WHERE subject_key = ? ORDER BY english_key LIMIT ?""",
+                (key, self.MAX_SUBJECT_TERMS),
+            ).fetchall()
+        return {str(row["english"]): str(row["chinese"]) for row in rows}
+
+    def save_subject_term(self, subject: str, english: str, chinese: str) -> None:
+        subject = " ".join(subject.split())
+        english = " ".join(english.split())
+        chinese = " ".join(chinese.split())
+        if not subject or not english or not chinese:
+            raise ValueError("课程领域、英文术语和中文释义都不能为空。")
+        if len(subject) > 80 or len(english) > 100 or len(chinese) > 160:
+            raise ValueError("术语过长，请缩短课程领域、英文或中文释义。")
+        subject_key, english_key = self._term_key(subject), self._term_key(english)
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT 1 FROM subject_terms WHERE subject_key = ? AND english_key = ?",
+                (subject_key, english_key),
+            ).fetchone()
+            if existing is None:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM subject_terms WHERE subject_key = ?",
+                    (subject_key,),
+                ).fetchone()[0]
+                if count >= self.MAX_SUBJECT_TERMS:
+                    raise ValueError(f"每个课程领域最多保存 {self.MAX_SUBJECT_TERMS} 条术语。")
+            connection.execute(
+                """INSERT INTO subject_terms
+                   (subject_key, subject_name, english_key, english, chinese, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(subject_key, english_key) DO UPDATE SET
+                     subject_name=excluded.subject_name, english=excluded.english,
+                     chinese=excluded.chinese, updated_at=excluded.updated_at""",
+                (subject_key, subject, english_key, english, chinese, utc_now()),
+            )
+
+    def delete_subject_term(self, subject: str, english: str) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM subject_terms WHERE subject_key = ? AND english_key = ?",
+                (self._term_key(subject), self._term_key(english)),
+            )
+            return cursor.rowcount > 0
 
     def initialize(self) -> None:
         with self.connect() as connection:
@@ -275,6 +353,137 @@ class CourseRepository:
             )
             if cursor.rowcount == 0:
                 raise RuntimeError("没有找到需要标记的课堂字幕。")
+
+    def correct_segment(
+        self,
+        course_id: str,
+        segment_id: str,
+        original_text: str,
+        translated_text: str,
+        expected_original: str,
+        expected_translation: str,
+        keep_translation_confirmed: bool = False,
+    ) -> bool:
+        """Atomically save a post-class correction and flag generated notes as stale."""
+        original = original_text.strip()
+        translation = translated_text.strip()
+        if not original:
+            raise ValueError("英文原文不能为空。")
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT s.original_text, s.translated_text, s.translation_status, c.status
+                   FROM segments s JOIN courses c ON c.id = s.course_id
+                   WHERE s.id = ? AND s.course_id = ?""",
+                (segment_id, course_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("这句课堂记录不存在，请刷新课程库。")
+            if str(row["status"]) in {"recording", "transcribing", "translating", "organizing"}:
+                raise RuntimeError("课堂仍在处理，请结束后再校对字幕。")
+            if str(row["translation_status"]) == "translating":
+                raise RuntimeError("这句仍在后台翻译，请稍后再校对。")
+            if (str(row["original_text"]), str(row["translated_text"])) != (
+                expected_original, expected_translation
+            ):
+                raise RuntimeError("这句内容已被其他操作更新，请重新打开校对窗口。")
+            if (
+                original != expected_original
+                and translation == expected_translation
+                and translation
+                and not keep_translation_confirmed
+            ):
+                raise ValueError("英文已修改：请同时校对中文，或清空中文以便稍后补译。")
+            if (original, translation) == (expected_original, expected_translation):
+                return False
+            connection.execute(
+                """INSERT INTO segment_corrections
+                   (segment_id, previous_original_text, previous_translated_text, corrected_at)
+                   VALUES (?, ?, ?, ?)""",
+                (segment_id, expected_original, expected_translation, utc_now()),
+            )
+            cursor = connection.execute(
+                """UPDATE segments
+                   SET original_text = ?, translated_text = ?, translation_status = ?,
+                       translation_error = ''
+                   WHERE id = ? AND course_id = ?
+                     AND original_text = ? AND translated_text = ?""",
+                (
+                    original, translation, "completed" if translation else "retry",
+                    segment_id, course_id, expected_original, expected_translation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("这句内容已被其他操作更新，请重新打开校对窗口。")
+            connection.execute(
+                """UPDATE courses
+                   SET status = 'needs_attention', updated_at = ?,
+                       error_message = '字幕已人工校对，整理笔记可能过时；请在课程库重新整理。'
+                   WHERE id = ?""",
+                (utc_now(), course_id),
+            )
+        return True
+
+    def has_segment_corrections(self, segment_id: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM segment_corrections WHERE segment_id = ? LIMIT 1",
+                (segment_id,),
+            ).fetchone()
+            return row is not None
+
+    def undo_last_segment_correction(
+        self,
+        course_id: str,
+        segment_id: str,
+        expected_original: str,
+        expected_translation: str,
+    ) -> bool:
+        """Restore the most recent saved version without losing older revisions."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT s.original_text, s.translated_text, s.translation_status, c.status
+                   FROM segments s JOIN courses c ON c.id = s.course_id
+                   WHERE s.id = ? AND s.course_id = ?""",
+                (segment_id, course_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("这句课堂记录不存在，请刷新课程库。")
+            if str(row["status"]) in {"recording", "transcribing", "translating", "organizing"}:
+                raise RuntimeError("课堂仍在处理，请结束后再撤销校对。")
+            if str(row["translation_status"]) == "translating":
+                raise RuntimeError("这句仍在后台翻译，请稍后再撤销。")
+            if (str(row["original_text"]), str(row["translated_text"])) != (
+                expected_original, expected_translation
+            ):
+                raise RuntimeError("这句内容已被其他操作更新，请重新打开校对窗口。")
+            revision = connection.execute(
+                """SELECT id, previous_original_text, previous_translated_text
+                   FROM segment_corrections WHERE segment_id = ? ORDER BY id DESC LIMIT 1""",
+                (segment_id,),
+            ).fetchone()
+            if revision is None:
+                return False
+            previous_original = str(revision["previous_original_text"])
+            previous_translation = str(revision["previous_translated_text"])
+            cursor = connection.execute(
+                """UPDATE segments SET original_text = ?, translated_text = ?,
+                   translation_status = ?, translation_error = ''
+                   WHERE id = ? AND course_id = ?
+                     AND original_text = ? AND translated_text = ?""",
+                (previous_original, previous_translation,
+                 "completed" if previous_translation else "retry", segment_id, course_id,
+                 expected_original, expected_translation),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("这句内容已被其他操作更新，请重新打开校对窗口。")
+            connection.execute("DELETE FROM segment_corrections WHERE id = ?", (revision["id"],))
+            connection.execute(
+                """UPDATE courses SET status = 'needs_attention', updated_at = ?,
+                   error_message = '字幕校对已撤销，整理笔记可能过时；请在课程库重新整理。'
+                   WHERE id = ?""",
+                (utc_now(), course_id),
+            )
+        return True
 
     def set_translation_state(
         self,

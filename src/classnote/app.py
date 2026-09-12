@@ -6,6 +6,7 @@ import sys
 from openai import OpenAI
 
 from .config import Settings
+from .courseware import CourseContext, merge_subject_context
 from .exporter import export_markdown
 from .models import CourseResult
 from .services import (
@@ -67,7 +68,9 @@ def process_course(
         )
 
     repository = CourseRepository(settings.database_path)
-    result = pipeline.run_incremental(audio_path, title, subject, repository, terms)
+    remembered = repository.get_subject_terms(subject)
+    merged_terms = merge_subject_context(CourseContext(terms=terms or {}), remembered).terms
+    result = pipeline.run_incremental(audio_path, title, subject, repository, merged_terms)
     try:
         exported_path = export_markdown(result, settings.export_dir).resolve()
         repository.finalize_course(result.id, result.notes_markdown, str(exported_path))
