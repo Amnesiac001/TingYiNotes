@@ -108,9 +108,14 @@ class LiveTranslationCoordinator:
         if self._closed:
             return all(not thread.is_alive() for thread in self.threads)
         self._closed = True
+        deadline = time.monotonic() + max(0.0, timeout)
         for _ in self.threads:
-            self.queue.put(None)
-        deadline = time.monotonic() + timeout
+            try:
+                self.queue.put(None, timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Full:
+                # A full backlog must not turn a bounded shutdown into an
+                # unbounded wait for a stalled network translation.
+                break
         for thread in self.threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         alive = [thread for thread in self.threads if thread.is_alive()]
@@ -131,7 +136,10 @@ class LiveTranslationCoordinator:
                     )
                 self.queue.task_done()
             for _ in alive:
-                self.queue.put(None)
+                try:
+                    self.queue.put_nowait(None)
+                except queue.Full:
+                    break
         # Publish the final shutdown snapshot (normally zero; timed-out workers may
         # still have only their termination sentinels queued).
         self._emit_metrics()
@@ -169,7 +177,12 @@ class LiveTranslationCoordinator:
 
     def _worker(self) -> None:
         while True:
-            job = self.queue.get()
+            try:
+                job = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                if self._closed:
+                    return
+                continue
             if job is None:
                 self.queue.task_done()
                 return

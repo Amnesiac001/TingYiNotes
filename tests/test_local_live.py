@@ -195,6 +195,79 @@ def test_buffered_opening_audio_keeps_its_original_timestamp() -> None:
     assert submitted == [("Opening sentence.", 0, 1000)]
 
 
+def test_stop_drains_buffered_audio_even_when_model_loaded_during_pause() -> None:
+    submitted: list[tuple[str, int, int]] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.started_monotonic = local_live.time.monotonic() - 20
+    session.audio_queue = queue.Queue()
+    session.audio_queue.put((bytes(16000 * 2), 1000))
+    session.stop_event = threading.Event()
+    session.stop_event.set()
+    session.pause_event = threading.Event()
+    session.pause_event.set()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda *args: None
+    session.translations = SimpleNamespace(
+        submit=lambda text, start, end: submitted.append((text, start, end))
+    )
+    session._transcribe = lambda model, audio: "Opening sentence."
+    speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
+
+    worker = threading.Thread(
+        target=session._recognition_loop,
+        args=(object(), speech, object()),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=1)
+    stalled = worker.is_alive()
+    if stalled:
+        session.pause_event.clear()
+        worker.join(timeout=1)
+
+    assert not stalled, "结束课堂不应等待用户再次点击继续"
+    assert submitted == [("Opening sentence.", 0, 1000)]
+
+
+def test_pause_drains_queued_audio_as_one_sentence() -> None:
+    submitted: list[tuple[str, int, int]] = []
+    translated = threading.Event()
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.started_monotonic = local_live.time.monotonic() - 20
+    session.audio_queue = queue.Queue()
+    session.audio_queue.put((bytes(8000 * 2), 500))
+    session.audio_queue.put((bytes(8000 * 2), 1000))
+    session.stop_event = threading.Event()
+    session.pause_event = threading.Event()
+    session.pause_event.set()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda *args: None
+
+    def submit(text: str, start: int, end: int) -> None:
+        submitted.append((text, start, end))
+        translated.set()
+
+    session.translations = SimpleNamespace(submit=submit)
+    session._transcribe = lambda model, audio: "Opening sentence."
+    speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
+    worker = threading.Thread(
+        target=session._recognition_loop,
+        args=(object(), speech, object()),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert translated.wait(timeout=1), "暂停后应整理已经录到的语音"
+    finally:
+        session.stop_event.set()
+        worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert submitted == [("Opening sentence.", 0, 1000)]
+
+
 def test_model_load_failure_closes_capture_without_finalizing_empty_course() -> None:
     actions: list[str] = []
     events: list[tuple[str, object]] = []

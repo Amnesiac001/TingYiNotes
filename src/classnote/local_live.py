@@ -411,8 +411,17 @@ class LocalLiveCourseSession:
         refresh_seconds = self.settings.local_refresh_ms / 1000
 
         while True:
-            final_pass = self.stop_event.is_set() and self.audio_queue.empty()
-            pause_flush = self.pause_event.is_set() and not final_pass
+            stopping = self.stop_event.is_set()
+            final_pass = stopping and self.audio_queue.empty()
+            # Stop must drain buffered opening audio even if the user paused
+            # before the local model finished loading.
+            # Drain audio captured just before Pause as one utterance, then
+            # flush it. Otherwise a queued opening sentence waits for Resume.
+            pause_flush = (
+                self.pause_event.is_set()
+                and not stopping
+                and self.audio_queue.empty()
+            )
             if pause_flush and not buffer:
                 time.sleep(0.08)
                 continue

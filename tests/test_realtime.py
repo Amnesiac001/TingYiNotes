@@ -1,4 +1,7 @@
-from classnote.realtime_live import parse_transcript_event
+import queue
+import time
+
+from classnote.realtime_live import RealtimeLiveCourseSession, parse_transcript_event
 
 
 def test_parse_realtime_delta_and_completion() -> None:
@@ -36,3 +39,24 @@ def test_parse_vad_timestamps_and_error() -> None:
 
 def test_unknown_realtime_event_is_ignored() -> None:
     assert parse_transcript_event({"type": "rate_limits.updated"}) is None
+
+
+def test_full_audio_queue_cannot_block_realtime_shutdown() -> None:
+    session = RealtimeLiveCourseSession.__new__(RealtimeLiveCourseSession)
+    session.audio_queue = queue.Queue(maxsize=1)
+    session.audio_queue.put(b"unsent audio")
+    session.sender_thread = None
+
+    started = time.monotonic()
+    assert session._stop_audio_sender(timeout=0.05) is False
+    assert time.monotonic() - started < 0.5
+    assert session.audio_queue.get_nowait() == b"unsent audio"
+
+
+def test_empty_audio_queue_accepts_shutdown_marker() -> None:
+    session = RealtimeLiveCourseSession.__new__(RealtimeLiveCourseSession)
+    session.audio_queue = queue.Queue(maxsize=1)
+    session.sender_thread = None
+
+    assert session._stop_audio_sender(timeout=0.05) is True
+    assert session.audio_queue.get_nowait() is None

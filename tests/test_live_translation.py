@@ -1,5 +1,6 @@
 from pathlib import Path
 import threading
+import time
 
 from classnote.live_translation import LiveTranslationCoordinator, protected_tokens
 from classnote.models import CourseResult
@@ -101,3 +102,44 @@ def test_failed_live_translation_retries_the_same_persisted_segment(tmp_path: Pa
     assert rows[0]["id"] == segment.id
     assert rows[0]["translation_status"] == "completed"
     assert rows[0]["translated_text"] == "重试成功"
+
+
+def test_full_translation_queue_cannot_block_bounded_class_shutdown(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowProcessor:
+        def translate(self, text: str, subject: str, terms: dict[str, str]) -> str:
+            entered.set()
+            release.wait(timeout=3)
+            return "已翻译"
+
+    repository = CourseRepository(tmp_path / "backlog.db")
+    result = CourseResult("积压课堂", "测试", "local:mic", [], "")
+    repository.create_course(result)
+    coordinator = LiveTranslationCoordinator(
+        result, repository, SlowProcessor(), "测试", lambda *_: None,
+        workers=1, max_queue=1,
+    )
+    coordinator.start()
+    first = coordinator.submit("First", 0, 1000)
+    assert entered.wait(timeout=1)
+    second = coordinator.submit("Second", 1000, 2000)
+    watchdog = threading.Timer(2, release.set)
+    watchdog.daemon = True
+    watchdog.start()
+
+    started = time.monotonic()
+    finished = coordinator.close_and_wait(timeout=0.1)
+    elapsed = time.monotonic() - started
+    release.set()
+    watchdog.cancel()
+    for worker in coordinator.threads:
+        worker.join(timeout=2)
+
+    rows = {row["id"]: row for row in repository.get_course_segments(result.id)}
+    assert not finished
+    assert elapsed < 1.2
+    assert rows[first.id]["original_text"] == "First"
+    assert rows[second.id]["original_text"] == "Second"
+    assert rows[second.id]["translation_status"] == "retry"

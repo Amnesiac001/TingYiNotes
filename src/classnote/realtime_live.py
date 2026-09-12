@@ -290,9 +290,11 @@ class RealtimeLiveCourseSession:
             self.stream.stop()
             self.stream.close()
             self.stream = None
-        self.audio_queue.put(None)
-        if self.sender_thread is not None:
-            self.sender_thread.join(timeout=3)
+        if not self._stop_audio_sender(timeout=3):
+            self.event(
+                "warning",
+                "实时音频发送未能在结束时排空，最后一段语音可能缺失；已完成的字幕仍已保存。",
+            )
         try:
             # Commit a sentence that is still in progress when the user clicks Stop.
             self.connection.input_audio_buffer.commit()
@@ -306,6 +308,18 @@ class RealtimeLiveCourseSession:
         self.translations.close_and_wait(timeout=45)
         self.live_summary.close(timeout=2)
         self._finalize()
+
+    def _stop_audio_sender(self, timeout: float) -> bool:
+        """Bound both the final queue write and sender join during shutdown."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        try:
+            self.audio_queue.put(None, timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Full:
+            return False
+        if self.sender_thread is not None:
+            self.sender_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            return not self.sender_thread.is_alive()
+        return True
 
     def _finalize(self) -> None:
         if self.finalized:
