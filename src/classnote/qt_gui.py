@@ -1308,6 +1308,8 @@ class LivePage(Page):
         self.toggle_fullscreen = toggle_fullscreen
         self.repository = repository
         self.session: object | None = None
+        self.cleanup_pending = False
+        self.suppress_finish_dialog = False
         self.transcript_cards: dict[str, ParagraphCard] = {}
         self.paragraph_cards: list[ParagraphCard] = []
         self.paragraph_groups: list[list[Segment]] = []
@@ -2090,6 +2092,9 @@ class LivePage(Page):
         self._set_quality_text(self.translation_quality, text, color)
 
     def start(self) -> None:
+        if self.cleanup_pending:
+            self.notice.show_notice("上一节课堂仍在安全收尾，请稍候再开始新课堂。", error=False)
+            return
         if not self.devices or self.device_combo.currentIndex() < 0:
             self.notice.show_notice("没有找到可用的录音设备。请连接或启用麦克风后刷新设备。", error=True)
             return
@@ -2131,6 +2136,7 @@ class LivePage(Page):
                 lambda name, payload: self.bridge.event.emit(name, payload),
                 self.effective_course_context(),
             )
+            self.cleanup_pending = True
             self.session.start()  # type: ignore[attr-defined]
             self.elapsed = 0
             self.timer.start(1000)
@@ -2157,6 +2163,7 @@ class LivePage(Page):
             self.question_button.setEnabled(True)
         except Exception as exc:
             self.session = None
+            self.cleanup_pending = False
             self.notice.show_notice(friendly_error(exc), "检查设置", error=True)
 
     def toggle_pause(self) -> None:
@@ -2356,7 +2363,10 @@ class LivePage(Page):
             row = self.repository.get_course(result.id)
             needs_attention = row is not None and str(row["status"]) == "needs_attention"
             pending_count = len(self.repository.pending_segments(result.id)) if needs_attention else 0
+            closing = self.suppress_finish_dialog
             self.reset()
+            if closing:
+                return
             if needs_attention:
                 detail = str(row["error_message"] or "部分内容需要课后处理。")
                 message = (
@@ -2374,6 +2384,11 @@ class LivePage(Page):
         elif name == "error":
             self.notice.show_notice(friendly_error(payload), "检查设置", error=True)
             self.reset()
+        elif name == "session_ended":
+            self.cleanup_pending = False
+            self.suppress_finish_dialog = False
+            if self.session is None:
+                self.start_button.setEnabled(True)
 
     def add_segment(self, segment: Segment, pending: bool = False) -> None:
         if segment.id in self.segments_by_id:
@@ -2649,7 +2664,7 @@ class LivePage(Page):
         self.timer.stop()
         self._disarm_stop(restore_status=False)
         self.record_dot.setStyleSheet(f"color:{COLORS['muted']}; font-size:15px;")
-        self.start_button.setEnabled(True)
+        self.start_button.setEnabled(not self.cleanup_pending)
         self.start_button.show()
         self.pause_button.setEnabled(False)
         self.pause_button.setText("暂停")
@@ -3126,6 +3141,7 @@ class SettingsPage(Page):
         self.settings = settings
         self.runtime_check = RuntimeCheckBridge(self)
         self.runtime_check.finished.connect(self.local_runtime_finished)
+        self._local_probe_snapshot: tuple[int, str] | None = None
         self.text_check = RuntimeCheckBridge(self)
         self.text_check.finished.connect(self.text_connection_finished)
         self._text_probe_snapshot: tuple[str, str, str, str | None] | None = None
@@ -3174,14 +3190,8 @@ class SettingsPage(Page):
         speech_actions = QHBoxLayout()
         self.speech_status = QLabel("本地模型首次使用会自动下载，之后可离线完成英文识别。")
         self.speech_status.setObjectName("Muted")
-        self.test_local_button = QPushButton(
-            "下载并预热模型" if IS_MACOS else "检测本地识别"
-        )
-        self.test_local_button.setToolTip(
-            "提前下载并加载模型，避免第一次上课时等待"
-            if IS_MACOS
-            else "检测 CUDA、FP16 和本地识别依赖"
-        )
+        self.test_local_button = QPushButton("下载并预热模型")
+        self.test_local_button.setToolTip("提前下载并加载所选模型，避免第一次上课时等待；不会调用文本 API")
         self.test_local_button.clicked.connect(self.test_local_runtime)
         speech_actions.addWidget(self.speech_status, 1)
         speech_actions.addWidget(self.test_local_button)
@@ -3426,43 +3436,57 @@ class SettingsPage(Page):
         )
 
     def test_local_runtime(self) -> None:
+        if self.speech_provider.currentIndex() != 0:
+            self.notice.show_notice("请先选择本地实时识别，再下载并预热模型。", error=True)
+            return
+        model = self.speech_model.currentText().strip()
+        if not model:
+            self.notice.show_notice("请先选择一个本地识别模型。", error=True)
+            return
         if IS_MACOS:
             if not IS_APPLE_SILICON:
                 self.speech_status.setText("当前是 Intel Mac，无法使用 MLX 本地识别")
                 self.notice.show_notice("Intel Mac 请改用 OpenAI 云端实时语音；本地模式面向 M1 或更新机型。", error=True)
                 return
-            model = self.speech_model.currentText().strip()
-            if not model:
-                self.notice.show_notice("请先选择一个 Mac 本地识别模型。", error=True)
-                return
-            self.test_local_button.setEnabled(False)
-            self.speech_status.setText("正在下载或加载模型；首次可能需要几分钟，请保持网络连接……")
-            self.notice.show_notice("模型准备期间可以继续查看设置，但请不要退出软件。")
-            threading.Thread(
-                target=self._prepare_mac_runtime,
-                args=(model,),
-                name="classnote-mac-preflight",
-                daemon=True,
-            ).start()
-            return
+        self._local_probe_snapshot = (self.speech_provider.currentIndex(), model)
+        self.test_local_button.setEnabled(False)
+        self.speech_status.setText("正在下载或加载模型；首次可能需要几分钟，请保持网络连接……")
+        self.notice.show_notice("模型准备期间可以继续查看设置，但请不要退出软件。")
+        threading.Thread(
+            target=self._prepare_mac_runtime if IS_MACOS else self._prepare_windows_runtime,
+            args=(model,),
+            name="classnote-mac-preflight" if IS_MACOS else "classnote-rtx-preflight",
+            daemon=True,
+        ).start()
+
+    def _prepare_windows_runtime(self, model: str) -> None:
         try:
-            from .local_live import _prepare_nvidia_dlls
+            from .local_live import _prepare_nvidia_dlls, preload_local_model, warmup_local_model
 
             _prepare_nvidia_dlls()
             import ctranslate2
 
+            settings = Settings.load()
             devices = ctranslate2.get_cuda_device_count()
             compute = ctranslate2.get_supported_compute_types("cuda") if devices else set()
-            if devices and "float16" in compute:
-                model = self.speech_model.currentText().strip() or "distil-large-v3"
-                self.speech_status.setText(f"检测通过：1 块 CUDA 显卡 · FP16 · {model}")
-                self.notice.show_notice("本地 GPU 识别环境正常，可以用于实时课堂。")
-            else:
-                self.speech_status.setText("未检测到可用的 CUDA FP16 环境")
-                self.notice.show_notice("本地 GPU 环境不可用，可暂时选择 OpenAI 云端实时语音。", error=True)
+            if not devices or settings.local_compute_type not in compute:
+                raise RuntimeError("未检测到所选模型所需的 CUDA 计算环境。请检查显卡驱动与本地识别依赖。")
+            loaded_model, reused = preload_local_model(
+                model, settings.local_compute_type, settings.database_path.parent / "models"
+            )
+            warmup_local_model(loaded_model)
+            microphones = sum(not device.is_loopback for device in list_input_devices())
+            if not microphones:
+                raise RuntimeError("没有检测到麦克风。请检查连接及 Windows 麦克风权限。")
+            detail = f"RTX · {settings.local_compute_type} · {microphones} 个麦克风 · {model}"
+            message = (
+                "模型已经预热；保存并应用当前设置后即可开始课堂。"
+                if reused
+                else "模型下载和预热完成；保存并应用当前设置后即可开始课堂。"
+            )
+            self.runtime_check.finished.emit(True, detail, message)
         except Exception as exc:
-            self.speech_status.setText("本地识别组件检测失败")
-            self.notice.show_notice(friendly_error(exc), error=True)
+            self.runtime_check.finished.emit(False, "Windows 本地识别准备失败", friendly_error(exc))
 
     def _prepare_mac_runtime(self, model: str) -> None:
         try:
@@ -3489,6 +3513,10 @@ class SettingsPage(Page):
 
     def local_runtime_finished(self, success: bool, detail: str, message: str) -> None:
         self.test_local_button.setEnabled(True)
+        if self._local_probe_snapshot != (self.speech_provider.currentIndex(), self.speech_model.currentText().strip()):
+            self.speech_status.setText("测试期间模型或语音服务已修改，请重新预热当前选择。")
+            self.notice.show_notice("刚才的预热结果不对应当前选择，请重新测试。", error=True)
+            return
         self.speech_status.setText(detail)
         self.notice.show_notice(message, error=not success)
 
@@ -3781,14 +3809,15 @@ class MainWindow(QMainWindow):
             self.file_page.handle_event(name, payload)
         else:
             self.live_page.handle_event(name, payload)
-            if self._close_after_session and name in {"finished", "error"}:
+            if self._close_after_session and name == "session_ended":
+                self._close_after_session = False
                 QTimer.singleShot(0, self.close)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._close_after_session:
+            event.ignore()
+            return
         if self.live_page.session is not None:
-            if self._close_after_session:
-                event.ignore()
-                return
             if not confirm_message(
                 self,
                 "课堂仍在进行",
@@ -3797,7 +3826,12 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self._close_after_session = True
+            self.live_page.suppress_finish_dialog = True
             self.live_page.stop(confirmed=True)
+            event.ignore()
+            return
+        if self.live_page.cleanup_pending:
+            self._close_after_session = True
             event.ignore()
             return
         if self.library_page._recovery_running and not confirm_recovery_exit(self):

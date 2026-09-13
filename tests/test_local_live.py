@@ -2,13 +2,42 @@ import queue
 import sys
 import threading
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
 from classnote.courseware import CourseContext
+from classnote.models import CourseResult
+from classnote.recovery_inventory import list_recovery_candidates
+from classnote.storage import CourseRepository
+from classnote.temporary_audio import start_temporary_audio
 import classnote.local_live as local_live
 from classnote.local_live import LocalLiveCourseSession, common_prefix
+
+
+def test_frozen_windows_registers_bundled_cuda_directories(monkeypatch, tmp_path: Path) -> None:
+    bundle = tmp_path / "_internal"
+    cublas = bundle / "nvidia" / "cublas" / "bin"
+    cudnn = bundle / "nvidia" / "cudnn" / "bin"
+    cublas.mkdir(parents=True)
+    cudnn.mkdir(parents=True)
+    registered: list[str] = []
+    monkeypatch.setattr(local_live.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(local_live.sys, "_MEIPASS", str(bundle), raising=False)
+    monkeypatch.setattr(local_live.site, "getsitepackages", lambda: [])
+    monkeypatch.setattr(local_live.os, "add_dll_directory", lambda path: registered.append(path))
+    monkeypatch.setattr(local_live, "_DLL_HANDLES", [])
+    monkeypatch.setattr(local_live, "_REGISTERED_DLL_DIRS", set())
+    monkeypatch.setenv("PATH", local_live.os.environ.get("PATH", ""))
+
+    local_live._prepare_nvidia_dlls()
+
+    assert registered == [str(cublas), str(cudnn)]
+    first_path = local_live.os.environ["PATH"]
+    local_live._prepare_nvidia_dlls()
+    assert registered == [str(cublas), str(cudnn)]
+    assert local_live.os.environ["PATH"] == first_path
 
 
 def test_common_prefix_ignores_case_and_trailing_punctuation() -> None:
@@ -127,12 +156,12 @@ def test_loading_buffer_reports_audio_before_model_is_ready() -> None:
     assert payloads[0]["capacity_ms"] == 300_000
 
 
-def test_local_whisper_model_is_reused_for_the_next_class(monkeypatch) -> None:
-    created: list[object] = []
+def test_local_whisper_model_is_reused_for_the_next_class(monkeypatch, tmp_path: Path) -> None:
+    created: list[tuple[object, dict[str, object]]] = []
 
     class WhisperModel:
         def __init__(self, *args, **kwargs) -> None:
-            created.append(self)
+            created.append((self, kwargs))
 
     class VadOptions:
         def __init__(self, **kwargs) -> None:
@@ -150,19 +179,43 @@ def test_local_whisper_model_is_reused_for_the_next_class(monkeypatch) -> None:
 
     first = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
     first.settings = SimpleNamespace(
-        local_transcription_model="fake-model", local_compute_type="float16"
+        local_transcription_model="fake-model", local_compute_type="float16",
+        database_path=tmp_path / "classnote.db",
     )
     second = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
     second.settings = first.settings
 
+    preheated, preheat_reused = local_live.preload_local_model(
+        "fake-model", "float16", tmp_path / "models"
+    )
     first_model, _, _, first_reused = first._load_recognition_runtime()
     second_model, _, _, second_reused = second._load_recognition_runtime()
 
+    assert preheat_reused is False
     assert len(created) == 1
-    assert first_model is second_model
-    assert first_reused is False
+    assert created[0][1]["download_root"] == str((tmp_path / "models").resolve())
+    assert preheated is first_model is second_model
+    assert first_reused is True
     assert second_reused is True
     local_live._MODEL_CACHE.clear()
+
+
+def test_local_model_warmup_consumes_lazy_inference() -> None:
+    calls: list[str] = []
+
+    class Model:
+        def transcribe(self, audio, **kwargs):
+            assert audio.shape == (16000,)
+            assert kwargs == {"language": "en", "beam_size": 1}
+
+            def segments():
+                calls.append("inference")
+                yield object()
+
+            return segments(), None
+
+    local_live.warmup_local_model(Model())
+    assert calls == ["inference"]
 
 
 def test_buffered_opening_audio_keeps_its_original_timestamp() -> None:
@@ -324,6 +377,102 @@ def test_model_load_failure_closes_capture_without_finalizing_empty_course() -> 
     assert "finalize" not in actions
     assert session.stop_event.is_set()
     assert any(name == "error" for name, _ in events)
+
+
+def test_model_load_failure_keeps_opt_in_captured_audio_for_recovery(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "classnote.db")
+    result = CourseResult("Lecture", "Physics", "microphone", [], "")
+    repository.create_course(result)
+    events: list[tuple[str, object]] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.settings = SimpleNamespace(local_transcription_model="broken-model")
+    session.device = SimpleNamespace(is_loopback=False)
+    session.repository = repository
+    session.result = result
+    session.event = lambda name, payload: events.append((name, payload))
+    session.audio_queue = queue.Queue()
+    session.ready_event = threading.Event()
+    session.capture_ready_event = threading.Event()
+    session.model_ready_event = threading.Event()
+    session.stop_event = threading.Event()
+    session.pause_event = threading.Event()
+    session.started_monotonic = local_live.time.monotonic()
+    session.dropped_blocks = 0
+    session._last_buffer_report_second = -1
+    session.audio_monitor = SimpleNamespace(observe=lambda *args: None)
+    session.temporary_audio = start_temporary_audio(
+        repository.database_path, result.id, session.SAMPLE_RATE,
+        lambda message: events.append(("warning", message)),
+    )
+    assert session.temporary_audio is not None
+    session.translations = SimpleNamespace(close_and_wait=lambda timeout: None)
+    session.live_summary = SimpleNamespace(close=lambda timeout: None)
+
+    class Stream:
+        def start(self) -> None:
+            session._callback(b"\x01\x00" * 16000, 16000, None, None)
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    session._create_capture_stream = lambda: Stream()
+    session._load_recognition_runtime = lambda: (_ for _ in ()).throw(
+        RuntimeError("CUDA unavailable")
+    )
+
+    session._run()
+
+    row = repository.get_course(result.id)
+    assert row is not None and row["status"] == "failed"
+    candidates = list_recovery_candidates(repository)
+    assert len(candidates) == 1
+    assert candidates[0].course_id == result.id
+    assert candidates[0].audio_path == session.temporary_audio.path
+    assert any(name == "error" for name, _ in events)
+    assert [name for name, _ in events].index("error") > max(
+        index for index, (name, message) in enumerate(events)
+        if name == "warning" and "临时音频保留" in str(message)
+    )
+    assert events[-1] == ("session_ended", result.id)
+
+
+def test_translation_shutdown_error_still_closes_summary_and_ends_session() -> None:
+    order: list[str] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.settings = SimpleNamespace(local_transcription_model="fake-model")
+    session.device = SimpleNamespace(is_loopback=False)
+    session.repository = SimpleNamespace(
+        set_course_state=lambda *args: order.append("state")
+    )
+    session.result = SimpleNamespace(id="course", segments=[])
+    session.event = lambda name, payload: order.append(name)
+    session.audio_queue = queue.Queue()
+    session.ready_event = threading.Event()
+    session.capture_ready_event = threading.Event()
+    session.model_ready_event = threading.Event()
+    session.stop_event = threading.Event()
+    session.stream = None
+    session.temporary_audio = None
+    session.translations = SimpleNamespace(
+        close_and_wait=lambda timeout: (_ for _ in ()).throw(RuntimeError("worker failed"))
+    )
+    session.live_summary = SimpleNamespace(close=lambda timeout: order.append("summary-closed"))
+    session._create_capture_stream = lambda: SimpleNamespace(
+        start=lambda: None, stop=lambda: None, close=lambda: None,
+    )
+    session._load_recognition_runtime = lambda: (object(), object(), object(), False)
+    session._recognition_loop = lambda *args: None
+    session._finalize = lambda: order.append("finalize")
+
+    session._run()
+
+    assert "summary-closed" in order
+    assert "finalize" not in order
+    assert "error" in order
+    assert order[-1] == "session_ended"
 
 
 def test_pause_and_stop_explain_when_model_is_still_loading() -> None:

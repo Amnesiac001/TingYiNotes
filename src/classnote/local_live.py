@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import queue
 import site
+import sys
 import threading
 import time
 from pathlib import Path
@@ -25,6 +26,8 @@ from .usage import BudgetLimitReached, bind_course_usage
 
 LiveEvent = Callable[[str, object], None]
 _DLL_HANDLES: list[object] = []
+_REGISTERED_DLL_DIRS: set[str] = set()
+_DLL_REGISTRATION_LOCK = threading.Lock()
 _MODEL_CACHE: dict[tuple[str, str], object] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
@@ -96,19 +99,59 @@ def _prepare_nvidia_dlls() -> None:
     if os.name != "nt" or not hasattr(os, "add_dll_directory"):
         return
     roots = [Path(value) for value in site.getsitepackages()]
-    discovered: list[str] = []
-    for root in roots:
-        for relative in ("nvidia/cublas/bin", "nvidia/cudnn/bin"):
-            candidate = root / relative
-            if candidate.is_dir():
-                discovered.append(str(candidate))
-                try:
-                    _DLL_HANDLES.append(os.add_dll_directory(str(candidate)))
-                except OSError:
-                    pass
-    if discovered:
-        current = os.environ.get("PATH", "")
-        os.environ["PATH"] = os.pathsep.join(discovered + [current])
+    # PyInstaller keeps package DLLs in _internal, not in site-packages.
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        roots.insert(0, Path(sys._MEIPASS))
+    with _DLL_REGISTRATION_LOCK:
+        discovered: list[str] = []
+        for root in roots:
+            for relative in ("nvidia/cublas/bin", "nvidia/cudnn/bin"):
+                candidate = root / relative
+                candidate_text = str(candidate)
+                if candidate.is_dir() and candidate_text not in _REGISTERED_DLL_DIRS:
+                    discovered.append(candidate_text)
+                    try:
+                        _DLL_HANDLES.append(os.add_dll_directory(candidate_text))
+                    except OSError:
+                        pass
+                    _REGISTERED_DLL_DIRS.add(candidate_text)
+        if discovered:
+            current = os.environ.get("PATH", "")
+            os.environ["PATH"] = os.pathsep.join(discovered + [current])
+
+
+def preload_local_model(model_name: str, compute_type: str, model_root: Path) -> tuple[object, bool]:
+    """Load one RTX Whisper model and retain it for the next live classroom."""
+    if not model_name.strip():
+        raise ValueError("请先选择本地识别模型。")
+    _prepare_nvidia_dlls()
+    from faster_whisper import WhisperModel
+
+    key = (model_name, compute_type)
+    with _MODEL_CACHE_LOCK:
+        cached = _MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached, True
+        # Switching models must not leave multiple GPU models in the cache.
+        _MODEL_CACHE.clear()
+        model_root.mkdir(parents=True, exist_ok=True)
+        model = WhisperModel(
+            model_name,
+            device="cuda",
+            compute_type=compute_type,
+            num_workers=1,
+            download_root=str(model_root.resolve()),
+        )
+        _MODEL_CACHE[key] = model
+        return model, False
+
+
+def warmup_local_model(model: object) -> None:
+    """Run a tiny silent inference so CUDA kernels are ready before class."""
+    segments, _ = model.transcribe(  # type: ignore[attr-defined]
+        np.zeros(16000, dtype=np.float32), language="en", beam_size=1
+    )
+    list(segments)
 
 
 def common_prefix(left: str, right: str) -> str:
@@ -299,6 +342,7 @@ class LocalLiveCourseSession:
         model_name = getattr(
             self, "transcription_model_name", self.settings.local_transcription_model
         )
+        startup_error: str | None = None
         try:
             self.stream = self._create_capture_stream()
             self.stream.start()
@@ -343,32 +387,60 @@ class LocalLiveCourseSession:
             self._recognition_loop(model, get_speech_timestamps, vad_options)
         except Exception as exc:
             startup_failed = not self.ready_event.is_set()
-            self.event("error", self._friendly_local_error(exc))
+            message = self._friendly_local_error(exc)
+            if startup_failed:
+                startup_error = message
+            else:
+                self.event("warning", f"本地识别已停止：{message}；正在保存已有课堂内容。")
             self.stop_event.set()
             if startup_failed and not self.result.segments:
-                self.repository.delete_course(self.result.id)
+                # Capture starts before model loading. If an opt-in backup has
+                # received audio, keep the course so Recovery Center can offer
+                # the recording even though no transcript was produced.
+                if getattr(self, "temporary_audio", None) is not None and not self.audio_queue.empty():
+                    self.repository.set_course_state(
+                        self.result.id, "failed", f"本地识别启动失败；录音可在恢复中心找回。{message}"
+                    )
+                else:
+                    self.repository.delete_course(self.result.id)
             else:
                 self.repository.set_course_state(
-                    self.result.id, "needs_attention", self._friendly_local_error(exc)
+                    self.result.id, "needs_attention", message
                 )
         finally:
-            if self.stream is not None:
-                try:
-                    self.stream.stop()
-                    self.stream.close()
-                except Exception:
-                    pass
-                self.stream = None
-            self.translations.close_and_wait(timeout=45)
-            self.live_summary.close(timeout=2)
             try:
+                if self.stream is not None:
+                    try:
+                        self.stream.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self.stream.close()
+                    except Exception:
+                        pass
+                    self.stream = None
+                try:
+                    self.translations.close_and_wait(timeout=45)
+                finally:
+                    self.live_summary.close(timeout=2)
                 if self.ready_event.is_set():
                     self._finalize()
+            except Exception as exc:
+                message = f"课堂收尾失败，已保存的内容可在课程库恢复：{exc}"
+                try:
+                    self.repository.set_course_state(self.result.id, "needs_attention", message)
+                finally:
+                    self.event("error", message)
             finally:
-                finish_temporary_audio(
-                    getattr(self, "temporary_audio", None), self.repository, self.result.id,
-                    lambda message: self.event("warning", message),
-                )
+                try:
+                    finish_temporary_audio(
+                        getattr(self, "temporary_audio", None), self.repository, self.result.id,
+                        lambda message: self.event("warning", message),
+                    )
+                finally:
+                    if startup_error is not None:
+                        self.event("error", startup_error)
+                    self.event("session_ended", self.result.id)
 
     def _create_capture_stream(self) -> ResamplingRawInputStream | LoopbackPCMStream:
         if bool(getattr(self.device, "is_loopback", False)):
@@ -389,30 +461,13 @@ class LocalLiveCourseSession:
         )
 
     def _load_recognition_runtime(self) -> tuple[object, object, object, bool]:
-        _prepare_nvidia_dlls()
-        from faster_whisper import WhisperModel
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 
-        key = (
+        model, reused = preload_local_model(
             self.settings.local_transcription_model,
             self.settings.local_compute_type,
+            self.settings.database_path.parent / "models",
         )
-        with _MODEL_CACHE_LOCK:
-            model = _MODEL_CACHE.get(key)
-            reused = model is not None
-            if model is None:
-                # Keep only one GPU model alive. If the user changes models in
-                # Settings, release the previous cache reference before loading
-                # the new one instead of accumulating VRAM across classes.
-                _MODEL_CACHE.clear()
-                model = WhisperModel(
-                    self.settings.local_transcription_model,
-                    device="cuda",
-                    compute_type=self.settings.local_compute_type,
-                    num_workers=1,
-                    download_root=str(Path("data/models").resolve()),
-                )
-                _MODEL_CACHE[key] = model
         vad_options = VadOptions(
             threshold=0.5,
             min_speech_duration_ms=160,

@@ -30,6 +30,7 @@ macos = [
   "mlx-whisper; platform_machine == 'arm64'",
   "pyinstaller>=6.10; sys_platform == 'darwin'",
 ]
+windows-build = ["pyinstaller>=6.10; sys_platform == 'win32'"]
 
 [project.scripts]
 classnote = "classnote.cli:main"

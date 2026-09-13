@@ -8,18 +8,26 @@ import numpy as np
 from .local_live import LocalLiveCourseSession
 
 
-_MLX_MODELS_READY: set[str] = set()
+_MLX_MODEL_READY: str | None = None
 _MLX_MODEL_LOCK = threading.Lock()
 
 
+def note_mlx_model_used(model: str) -> None:
+    """Track the one model retained by mlx-whisper's in-process holder."""
+    global _MLX_MODEL_READY
+    with _MLX_MODEL_LOCK:
+        _MLX_MODEL_READY = model
+
+
 def preload_mlx_model(model: str) -> bool:
-    """Download/load an MLX Whisper model once; return True when already warm."""
+    """Warm the selected model unless it is the most recently used model."""
+    global _MLX_MODEL_READY
     if platform.machine().lower() not in {"arm64", "aarch64"}:
         raise RuntimeError("本地 MLX 识别需要 Apple 芯片（M1 或更新机型）。")
     import mlx_whisper
 
     with _MLX_MODEL_LOCK:
-        reused = model in _MLX_MODELS_READY
+        reused = model == _MLX_MODEL_READY
         if not reused:
             # MLX keeps the most recently loaded model in-process and Hugging Face
             # keeps downloaded weights on disk for subsequent launches.
@@ -31,7 +39,7 @@ def preload_mlx_model(model: str) -> bool:
                 temperature=0.0,
                 verbose=None,
             )
-            _MLX_MODELS_READY.add(model)
+            _MLX_MODEL_READY = model
     return reused
 
 

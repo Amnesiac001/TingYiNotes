@@ -89,22 +89,21 @@ class OpenAITranscriber:
 class LocalWhisperTranscriber:
     """Transcribe imported files on the local NVIDIA GPU."""
 
-    def __init__(self, model: str, compute_type: str = "float16"):
+    def __init__(
+        self, model: str, compute_type: str = "float16", model_root: Path | None = None,
+    ):
         self.model = model
         self.compute_type = compute_type
+        self.model_root = model_root
 
     def transcribe(self, audio_path: Path, subject: str) -> list[Segment]:
         # Imported lazily so demo mode and cloud mode can still start without CUDA.
-        from .local_live import _prepare_nvidia_dlls
+        from .config import Settings
+        from .local_live import preload_local_model
 
-        _prepare_nvidia_dlls()
-        from faster_whisper import WhisperModel
-
-        whisper = WhisperModel(
-            self.model,
-            device="cuda",
-            compute_type=self.compute_type,
-            download_root=str(Path("data/models").resolve()),
+        model_root = self.model_root or Settings.load().database_path.parent / "models"
+        whisper, _ = preload_local_model(
+            self.model, self.compute_type, model_root,
         )
         raw_segments, _ = whisper.transcribe(
             str(audio_path),
@@ -143,6 +142,7 @@ class MLXWhisperTranscriber:
 
     def transcribe(self, audio_path: Path, subject: str) -> list[Segment]:
         import mlx_whisper
+        from .mac_live import note_mlx_model_used
 
         result = mlx_whisper.transcribe(
             str(audio_path),
@@ -156,6 +156,7 @@ class MLXWhisperTranscriber:
             ),
             verbose=None,
         )
+        note_mlx_model_used(self.model)
         segments = [
             Segment(
                 original_text=str(value.get("text", "")).strip(),

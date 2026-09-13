@@ -388,11 +388,15 @@ class ChunkedMicrophoneRecorder:
 
     def stop(self) -> None:
         self.stop_event.set()
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-        if self.thread is not None:
-            self.thread.join(timeout=self.chunk_seconds + 3)
+        try:
+            if self.stream is not None:
+                try:
+                    self.stream.stop()
+                finally:
+                    self.stream.close()
+        finally:
+            if self.thread is not None:
+                self.thread.join(timeout=self.chunk_seconds + 3)
 
 
 class ChunkedLiveCourseSession:
@@ -492,8 +496,20 @@ class ChunkedLiveCourseSession:
         threading.Thread(target=self._finish_recording, daemon=True).start()
 
     def _finish_recording(self) -> None:
-        self.recorder.stop()
-        self.pending.put(None)
+        try:
+            self.recorder.stop()
+        except Exception as exc:
+            self.event("warning", f"结束录音时设备出错：{exc}；正在保存已收到的片段。")
+        finally:
+            collector = getattr(self.recorder, "thread", None)
+            if collector is not None and collector.is_alive():
+                self.event(
+                    "warning",
+                    "录音收集线程未能及时结束，最后片段可能缺失；已收到的字幕会继续保存。",
+                )
+            # The processor must always receive its sentinel, even when the
+            # microphone disappears during stop().
+            self.pending.put(None)
 
     def _process_chunks(self) -> None:
         while True:
@@ -531,14 +547,23 @@ class ChunkedLiveCourseSession:
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
-        self.live_summary.close(timeout=2)
         try:
+            self.live_summary.close(timeout=2)
             self._finalize()
+        except Exception as exc:
+            message = f"课堂收尾失败，已保存的内容可在课程库恢复：{exc}"
+            try:
+                self.repository.set_course_state(self.result.id, "needs_attention", message)
+            finally:
+                self.event("error", message)
         finally:
-            finish_temporary_audio(
-                self.temporary_audio, self.repository, self.result.id,
-                lambda message: self.event("warning", message),
-            )
+            try:
+                finish_temporary_audio(
+                    self.temporary_audio, self.repository, self.result.id,
+                    lambda message: self.event("warning", message),
+                )
+            finally:
+                self.event("session_ended", self.result.id)
 
     def _finalize(self) -> None:
         if not self.result.segments:

@@ -1,12 +1,16 @@
 from PyInstaller.utils.hooks import collect_all
+from pathlib import Path
+
+
+project_root = Path(SPECPATH).resolve().parent
 
 
 mlx_data, mlx_binaries, mlx_hidden = collect_all("mlx_whisper")
-brand_data = [("assets/brand/tingyiji-icon-256.png", "assets/brand")]
+brand_data = [(str(project_root / "assets" / "brand" / "tingyiji-icon-256.png"), "assets/brand")]
 
 a = Analysis(
-    ["macos/launcher.py"],
-    pathex=["."],
+    [str(project_root / "macos" / "launcher.py")],
+    pathex=[str(project_root / "src")],
     binaries=mlx_binaries,
     datas=mlx_data + brand_data,
     hiddenimports=mlx_hidden + ["mlx.core", "sounddevice"],
@@ -22,7 +26,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="TingYiNotes",
-    icon="assets/brand/tingyiji.icns",
+    icon=str(project_root / "assets" / "brand" / "tingyiji.icns"),
     console=False,
     target_arch="arm64",
 )
@@ -30,7 +34,7 @@ coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="TingYiNot
 app = BUNDLE(
     coll,
     name="听译记.app",
-    icon="assets/brand/tingyiji.icns",
+    icon=str(project_root / "assets" / "brand" / "tingyiji.icns"),
     bundle_identifier="com.tingyiji.notes",
     info_plist={
         "CFBundleDisplayName": "听译记",

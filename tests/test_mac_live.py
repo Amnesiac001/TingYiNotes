@@ -81,9 +81,39 @@ def test_preload_mlx_model_only_warms_once(monkeypatch) -> None:
     )
     monkeypatch.setattr(mac_live.platform, "machine", lambda: "arm64")
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_module)
-    mac_live._MLX_MODELS_READY.clear()
+    monkeypatch.setattr(mac_live, "_MLX_MODEL_READY", None)
 
     assert preload_mlx_model("mlx-community/test-preload") is False
     assert preload_mlx_model("mlx-community/test-preload") is True
     assert len(calls) == 1
     assert calls[0][1]["path_or_hf_repo"] == "mlx-community/test-preload"
+
+
+def test_preload_mlx_model_rewarms_after_switching_models(monkeypatch) -> None:
+    calls: list[str] = []
+    fake_module = SimpleNamespace(
+        transcribe=lambda audio, **kwargs: calls.append(kwargs["path_or_hf_repo"]) or {"text": ""}
+    )
+    monkeypatch.setattr(mac_live.platform, "machine", lambda: "arm64")
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_module)
+    monkeypatch.setattr(mac_live, "_MLX_MODEL_READY", None)
+
+    assert preload_mlx_model("model-a") is False
+    assert preload_mlx_model("model-b") is False
+    assert preload_mlx_model("model-a") is False
+    assert calls == ["model-a", "model-b", "model-a"]
+
+
+def test_mlx_file_transcription_warms_the_live_model(monkeypatch, tmp_path: Path) -> None:
+    calls: list[object] = []
+    fake_module = SimpleNamespace(
+        transcribe=lambda audio, **kwargs: calls.append(audio) or {"text": "A lecture sentence."}
+    )
+    monkeypatch.setattr(mac_live.platform, "machine", lambda: "arm64")
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_module)
+    monkeypatch.setattr(mac_live, "_MLX_MODEL_READY", None)
+
+    MLXWhisperTranscriber("model-a").transcribe(tmp_path / "lecture.wav", "Physics")
+
+    assert preload_mlx_model("model-a") is True
+    assert len(calls) == 1

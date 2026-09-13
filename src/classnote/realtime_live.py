@@ -304,34 +304,53 @@ class RealtimeLiveCourseSession:
         threading.Thread(target=self._finish, daemon=True).start()
 
     def _finish(self) -> None:
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-        if not self._stop_audio_sender(timeout=3):
-            self.event(
-                "warning",
-                "实时音频发送未能在结束时排空，最后一段语音可能缺失；已完成的字幕仍已保存。",
-            )
         try:
-            # Commit a sentence that is still in progress when the user clicks Stop.
-            self.connection.input_audio_buffer.commit()
-        except Exception:
-            pass
-        # Give server VAD and final transcript events a short grace period.
-        time.sleep(2)
-        self._close_transport()
-        if self.receiver_thread is not None:
-            self.receiver_thread.join(timeout=2)
-        self.translations.close_and_wait(timeout=45)
-        self.live_summary.close(timeout=2)
-        try:
+            if self.stream is not None:
+                try:
+                    self.stream.stop()
+                except Exception as exc:
+                    self.event("warning", f"录音设备结束时已断开：{exc}；正在继续保存已有字幕。")
+                try:
+                    self.stream.close()
+                except Exception as exc:
+                    self.event("warning", f"录音设备关闭失败：{exc}；正在继续保存已有字幕。")
+                self.stream = None
+            try:
+                if not self._stop_audio_sender(timeout=3):
+                    self.event(
+                        "warning",
+                        "实时音频发送未能在结束时排空，最后一段语音可能缺失；已完成的字幕仍已保存。",
+                    )
+                try:
+                    # Commit a sentence that is still in progress when the user clicks Stop.
+                    self.connection.input_audio_buffer.commit()
+                except Exception:
+                    pass
+                # Give server VAD and final transcript events a short grace period.
+                time.sleep(2)
+            finally:
+                self._close_transport()
+            if self.receiver_thread is not None:
+                self.receiver_thread.join(timeout=2)
+            try:
+                self.translations.close_and_wait(timeout=45)
+            finally:
+                self.live_summary.close(timeout=2)
             self._finalize()
+        except Exception as exc:
+            message = f"课堂收尾失败，已保存的内容可在课程库恢复：{exc}"
+            try:
+                self.repository.set_course_state(self.result.id, "needs_attention", message)
+            finally:
+                self.event("error", message)
         finally:
-            finish_temporary_audio(
-                self.temporary_audio, self.repository, self.result.id,
-                lambda message: self.event("warning", message),
-            )
+            try:
+                finish_temporary_audio(
+                    self.temporary_audio, self.repository, self.result.id,
+                    lambda message: self.event("warning", message),
+                )
+            finally:
+                self.event("session_ended", self.result.id)
 
     def _stop_audio_sender(self, timeout: float) -> bool:
         """Bound both the final queue write and sender join during shutdown."""

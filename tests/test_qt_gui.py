@@ -1,4 +1,5 @@
 import os
+import sys
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,12 +11,85 @@ from PySide6.QtGui import QCloseEvent
 
 from classnote.models import CourseResult, Segment
 from classnote.config import Settings
+import classnote.local_live as local_live
+import classnote.qt_gui as qt_gui
 from classnote.qt_gui import (
     Bridge, FilePage, LibraryPage, LivePage, MainWindow, SettingsPage, confirm_course_recovery,
     confirm_recovery_exit,
     friendly_error,
 )
 from classnote.storage import CourseRepository
+
+
+def test_windows_model_preflight_runs_in_background_and_rejects_stale_result(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("LIVE_MODE", "local")
+    monkeypatch.setattr(qt_gui, "IS_MACOS", False)
+    captured: dict[str, object] = {}
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(qt_gui.threading, "Thread", FakeThread)
+    page = SettingsPage(Settings.load())
+    page.speech_provider.setCurrentIndex(0)
+    page.speech_model.setCurrentText("small.en")
+    page.test_local_runtime()
+
+    assert captured["started"] is True
+    assert captured["target"] == page._prepare_windows_runtime
+    assert captured["args"] == ("small.en",)
+    assert not page.test_local_button.isEnabled()
+    page.speech_model.setCurrentText("distil-large-v3")
+    page.local_runtime_finished(True, "old ready", "old result")
+    assert page.test_local_button.isEnabled()
+    assert "重新预热" in page.speech_status.text()
+    page.close()
+    app.processEvents()
+
+
+def test_windows_model_preflight_reports_loaded_model_and_microphone(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("LIVE_MODE", "local")
+    monkeypatch.setattr(qt_gui, "IS_MACOS", False)
+    monkeypatch.setattr(local_live, "_prepare_nvidia_dlls", lambda: None)
+    preheated: list[object] = []
+    model = object()
+    monkeypatch.setattr(local_live, "preload_local_model", lambda *args: (model, False))
+    monkeypatch.setattr(local_live, "warmup_local_model", lambda value: preheated.append(value))
+    monkeypatch.setitem(
+        sys.modules,
+        "ctranslate2",
+        SimpleNamespace(
+            get_cuda_device_count=lambda: 1,
+            get_supported_compute_types=lambda _device: {"float16"},
+        ),
+    )
+    monkeypatch.setattr(qt_gui, "list_input_devices", lambda: [SimpleNamespace(is_loopback=False)])
+    page = SettingsPage(Settings.load())
+    page.speech_provider.setCurrentIndex(0)
+    page.speech_model.setCurrentText("small.en")
+    page._local_probe_snapshot = (0, "small.en")
+    monkeypatch.setattr(
+        qt_gui.Settings,
+        "load",
+        classmethod(lambda _cls: SimpleNamespace(
+            local_compute_type="float16", database_path=tmp_path / "classnote.db"
+        )),
+    )
+
+    page._prepare_windows_runtime("small.en")
+
+    assert "small.en" in page.speech_status.text()
+    assert "1 个麦克风" in page.speech_status.text()
+    assert preheated == [model]
+    assert page.test_local_button.isEnabled()
+    page.close()
+    app.processEvents()
 
 
 def test_friendly_error_explains_missing_key() -> None:
@@ -98,6 +172,57 @@ def test_incomplete_class_finish_offers_exact_course_record(monkeypatch, tmp_pat
     assert "待补译：1 句" in prompts[0][1]
     assert "文本预算已用完" in prompts[0][1]
     page.close()
+
+
+def test_live_page_waits_for_audio_cleanup_before_enabling_next_class(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "cleanup.db")
+    result = CourseResult("课", "网络", "mic", [], "")
+    repository.create_course(result)
+    dialogs: list[str] = []
+    monkeypatch.setattr(
+        qt_gui, "show_message", lambda _parent, _icon, title, _body: dialogs.append(title)
+    )
+    page = LivePage(Bridge(), lambda *_: None, lambda *_: None, lambda: None, repository)
+    page.session = object()
+    page.cleanup_pending = True
+    page.suppress_finish_dialog = True
+
+    page.handle_event("finished", (result, tmp_path / "note.md"))
+
+    assert page.session is None
+    assert not page.start_button.isEnabled()
+    assert not dialogs
+    page.handle_event("session_ended", result.id)
+    assert page.start_button.isEnabled()
+    page.close()
+    app.processEvents()
+
+
+def test_close_request_waits_for_session_cleanup(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("CLASSNOTE_DB", str(tmp_path / "close-live.db"))
+    window = MainWindow()
+    stopped: list[bool] = []
+    window.live_page.session = object()
+    window.live_page.cleanup_pending = True
+    monkeypatch.setattr(qt_gui, "confirm_message", lambda *args: True)
+    monkeypatch.setattr(window.live_page, "stop", lambda confirmed=False: stopped.append(confirmed))
+
+    request = QCloseEvent()
+    window.closeEvent(request)
+    assert not request.isAccepted()
+    assert stopped == [True]
+    assert window.live_page.suppress_finish_dialog
+
+    window.live_page.session = None  # The result arrived, but WAV cleanup has not.
+    too_early = QCloseEvent()
+    window.closeEvent(too_early)
+    assert not too_early.isAccepted()
+    window.handle_event("session_ended", "course")
+    assert not window._close_after_session
+    app.processEvents()
+    window.close()
 
 
 def test_course_recovery_confirmation_explains_extra_api_cost(monkeypatch, tmp_path: Path) -> None:

@@ -24,7 +24,7 @@ foreach ($directory in @("assets", "macos", "src")) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $directory) -Destination $target -Recurse
 }
 
-foreach ($file in @(".env.example", "pyproject.toml", "README.md")) {
+foreach ($file in @(".env.example", "pyproject.toml", "README.md", "LICENSE")) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination $target
 }
 

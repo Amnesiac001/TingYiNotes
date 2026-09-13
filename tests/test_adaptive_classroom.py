@@ -199,7 +199,11 @@ def test_window_waits_for_classroom_terminal_event_before_closing(monkeypatch) -
     assert window.isVisible()
     assert window._close_after_session
 
-    window.handle_event("error", "课堂收尾完成")
+    window.handle_event("error", "课堂整理失败，录音仍在收尾")
+    application.processEvents()
+    assert window.isVisible()
+
+    window.handle_event("session_ended", "course")
     application.processEvents()
     assert not window.isVisible()
 

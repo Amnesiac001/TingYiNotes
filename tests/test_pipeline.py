@@ -1,8 +1,46 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+import classnote.config as config
+import classnote.local_live as local_live
 from classnote.models import Segment
-from classnote.services import CoursePipeline
+from classnote.services import CoursePipeline, LocalWhisperTranscriber
 from classnote.storage import CourseRepository
+
+
+def test_file_transcriber_reuses_shared_model_and_stable_cache_path(monkeypatch, tmp_path: Path) -> None:
+    selected: list[tuple[str, str, Path]] = []
+
+    class CachedModel:
+        def transcribe(self, audio, **kwargs):
+            assert audio == str(tmp_path / "lesson.wav")
+            assert kwargs["language"] == "en"
+            return iter([SimpleNamespace(text=" A lecture sentence. ", start=0.2, end=1.4)]), None
+
+    cached = CachedModel()
+
+    def shared_model(name: str, compute: str, root: Path):
+        selected.append((name, compute, root))
+        return cached, True
+
+    monkeypatch.setattr(local_live, "preload_local_model", shared_model)
+    monkeypatch.setattr(
+        config.Settings, "load",
+        classmethod(lambda _cls: SimpleNamespace(database_path=tmp_path / "data" / "classnote.db")),
+    )
+    other_directory = tmp_path / "elsewhere"
+    other_directory.mkdir()
+    monkeypatch.chdir(other_directory)
+
+    rows = LocalWhisperTranscriber("distil-large-v3").transcribe(tmp_path / "lesson.wav", "网络")
+    LocalWhisperTranscriber(
+        "distil-large-v3", model_root=tmp_path / "data" / "models"
+    ).transcribe(tmp_path / "lesson.wav", "网络")
+
+    assert selected == [("distil-large-v3", "float16", tmp_path / "data" / "models")] * 2
+    assert [(row.original_text, row.start_ms, row.end_ms) for row in rows] == [
+        ("A lecture sentence.", 200, 1400)
+    ]
 
 
 class FakeTranscriber:

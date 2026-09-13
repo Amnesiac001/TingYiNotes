@@ -49,6 +49,7 @@ def process_course(
                 else LocalWhisperTranscriber(
                     settings.local_transcription_model,
                     settings.local_compute_type,
+                    settings.database_path.parent / "models",
                 )
             )
         else:
