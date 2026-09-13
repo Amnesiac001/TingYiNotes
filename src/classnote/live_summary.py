@@ -100,6 +100,8 @@ class LiveSummaryCoordinator:
         self._closed = False
         self._last_run = self.clock()
         self._snapshot = LiveSummarySnapshot()
+        self._summarized_ids: set[str] = set()
+        self._latest_summarized_end_ms = -1
         self._warning_shown = False
 
     def start(self) -> None:
@@ -112,6 +114,9 @@ class LiveSummaryCoordinator:
 
     def submit(self, segment: Segment) -> None:
         if self._closed or not segment.translated_text.strip():
+            return
+        guard = getattr(self.text_processor, "budget_guard", None)
+        if callable(guard) and not guard("summary"):
             return
         try:
             self.queue.put_nowait(segment)
@@ -139,7 +144,11 @@ class LiveSummaryCoordinator:
             except queue.Empty:
                 if self._closed:
                     return
-                if completed >= 3 and self.clock() - self._last_run >= self.min_interval:
+                threshold = 1 if self._summarized_ids else 3
+                if (
+                    self.clock() - self._last_run >= self.min_interval
+                    and self._pending_count() >= threshold
+                ):
                     completed = 0
                     self._last_run = self.clock()
                     self._summarize()
@@ -164,14 +173,29 @@ class LiveSummaryCoordinator:
             self._last_run = now
             self._summarize()
 
+    def _pending_segments(self) -> list[Segment]:
+        return sorted(
+            (
+                segment for segment in list(self.result.segments)
+                if segment.translated_text.strip() and segment.id not in self._summarized_ids
+            ),
+            key=lambda segment: (segment.start_ms, segment.end_ms, segment.id),
+        )
+
+    def _pending_count(self) -> int:
+        return sum(
+            segment.translated_text.strip() != "" and segment.id not in self._summarized_ids
+            for segment in list(self.result.segments)
+        )
+
     def _summarize(self) -> None:
+        guard = getattr(self.text_processor, "budget_guard", None)
+        if callable(guard) and not guard("summary"):
+            return
         method = getattr(self.text_processor, "summarize_live", None)
         if not callable(method):
             return
-        segments = sorted(
-            (segment for segment in self.result.segments if segment.translated_text.strip()),
-            key=lambda segment: (segment.start_ms, segment.end_ms, segment.id),
-        )[-self.max_context_segments :]
+        segments = self._pending_segments()[:self.max_context_segments]
         if not segments:
             return
         original = "\n".join(
@@ -194,7 +218,25 @@ class LiveSummaryCoordinator:
             snapshot = parse_live_summary(raw)
             if self._closed:
                 return
+            latest_in_batch = max(segment.end_ms for segment in segments)
+            if (
+                latest_in_batch <= self._latest_summarized_end_ms
+                and self._snapshot.topic
+                and snapshot.topic != self._snapshot.topic
+            ):
+                # A late translation may add facts, but it must not rewind the
+                # current-topic timeline to a section already covered earlier.
+                snapshot = LiveSummarySnapshot(
+                    topic=self._snapshot.topic,
+                    key_points=snapshot.key_points,
+                    terms=snapshot.terms,
+                    questions=snapshot.questions,
+                )
             self._snapshot = snapshot
+            self._summarized_ids.update(segment.id for segment in segments)
+            self._latest_summarized_end_ms = max(
+                self._latest_summarized_end_ms, latest_in_batch
+            )
             self._warning_shown = False
             self.event("summary_update", self._snapshot)
             self.event("summary_status", {"state": "updated"})

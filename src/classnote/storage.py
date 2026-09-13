@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .models import CourseResult, Segment, utc_now
+
+if TYPE_CHECKING:
+    from .usage import TextUsage
 
 
 SCHEMA = """
@@ -65,6 +70,22 @@ CREATE TABLE IF NOT EXISTS subject_terms (
 );
 CREATE INDEX IF NOT EXISTS idx_subject_terms_subject
 ON subject_terms(subject_key, english_key);
+CREATE TABLE IF NOT EXISTS text_usage_events (
+    course_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cached_input_tokens INTEGER,
+    estimated_cost_usd TEXT,
+    used_at TEXT NOT NULL,
+    PRIMARY KEY (course_id, provider, request_id),
+    FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_text_usage_course
+ON text_usage_events(course_id, used_at);
 """
 
 
@@ -138,6 +159,59 @@ class CourseRepository:
                 (self._term_key(subject), self._term_key(english)),
             )
             return cursor.rowcount > 0
+
+    def add_text_usage(
+        self, course_id: str, usage: TextUsage, estimated_cost_usd: Decimal | None,
+    ) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO text_usage_events
+                   (course_id, provider, request_id, model, phase, input_tokens,
+                    output_tokens, cached_input_tokens, estimated_cost_usd, used_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    course_id, usage.provider, usage.request_id, usage.model, usage.phase,
+                    usage.input_tokens, usage.output_tokens, usage.cached_input_tokens,
+                    str(estimated_cost_usd) if estimated_cost_usd is not None else None,
+                    usage.used_at.isoformat(),
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def get_text_usage_summary(self, course_id: str) -> dict[str, object]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT phase, input_tokens, output_tokens, cached_input_tokens,
+                          estimated_cost_usd FROM text_usage_events WHERE course_id = ?""",
+                (course_id,),
+            ).fetchall()
+        exact = [row for row in rows if row["input_tokens"] is not None and row["output_tokens"] is not None]
+        priced = [row for row in exact if row["estimated_cost_usd"] is not None]
+        phases = {}
+        for phase in {str(row["phase"]) for row in rows}:
+            phase_rows = [row for row in rows if row["phase"] == phase]
+            phase_exact = [
+                row for row in phase_rows
+                if row["input_tokens"] is not None and row["output_tokens"] is not None
+            ]
+            phases[phase] = {
+                "requests": len(phase_rows),
+                "input_tokens": sum(int(row["input_tokens"]) for row in phase_exact),
+                "output_tokens": sum(int(row["output_tokens"]) for row in phase_exact),
+            }
+        return {
+            "requests": len(rows),
+            "exact_requests": len(exact),
+            "unknown_requests": len(rows) - len(exact),
+            "unpriced_requests": len(exact) - len(priced),
+            "input_tokens": sum(int(row["input_tokens"]) for row in exact),
+            "output_tokens": sum(int(row["output_tokens"]) for row in exact),
+            "cached_input_tokens": sum(int(row["cached_input_tokens"] or 0) for row in exact),
+            "estimated_cost_usd": sum(
+                (Decimal(str(row["estimated_cost_usd"])) for row in priced), Decimal("0")
+            ),
+            "phases": phases,
+        }
 
     def initialize(self) -> None:
         with self.connect() as connection:

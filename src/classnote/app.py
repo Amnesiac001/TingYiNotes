@@ -65,6 +65,7 @@ def process_course(
                 client if settings.text_provider == "openai" else None,
             ),
             progress,
+            usage_provider=settings.text_provider,
         )
 
     repository = CourseRepository(settings.database_path)

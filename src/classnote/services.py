@@ -9,6 +9,7 @@ from openai import OpenAI
 
 from .courseware import relevant_terms
 from .models import CourseResult, Segment
+from .usage import BudgetLimitReached, TextUsage, bind_course_usage, parse_text_usage
 
 
 ProgressCallback = Callable[[str], None]
@@ -46,8 +47,10 @@ def _live_summary_request(
     original: str,
     translation: str,
 ) -> tuple[str, str]:
-    instructions = """你是课堂实时摘要器。把上一版摘要与最近已确认的课堂字幕合并为新的滚动摘要。
+    instructions = """你是课堂实时摘要器。把上一版摘要与本次新增、已确认的课堂字幕合并为新的滚动摘要。
 只能依据输入内容，不得臆测；忽略未完成的句子；保留技术名词、数字和限定条件。
+上一版摘要已覆盖更早的课堂内容，不要把新增字幕误当成整节课的全部；
+若新增字幕来自较早时间的晚到译文，只补充相应事实，不要无故把当前主题退回旧主题。
 只返回合法 JSON，不要 Markdown、解释或代码围栏，格式必须为：
 {"topic":"当前主题的一句话概括","key_points":["要点"],"terms":["英文术语：中文含义"],"questions":["仍待解释或值得复习的问题"]}
 topic 不超过 45 个汉字；key_points 最多 6 条；terms 最多 8 条；questions 最多 5 条。
@@ -55,7 +58,7 @@ topic 不超过 45 个汉字；key_points 最多 6 条；terms 最多 8 条；qu
     payload = (
         f"课程名称：{title}\n课程领域：{subject}\n\n"
         f"上一版滚动摘要：\n{previous or '{}'}\n\n"
-        f"最近英文字幕：\n{original}\n\n最近中文翻译：\n{translation}"
+        f"本次新增英文字幕：\n{original}\n\n本次新增中文翻译：\n{translation}"
     )
     return instructions, payload
 
@@ -175,10 +178,20 @@ class OpenAITextProcessor:
     def __init__(self, client: OpenAI, model: str):
         self.client = client
         self.model = model
+        self.usage_sink: Callable[[TextUsage], None] | None = None
+        self.usage_provider = "openai"
+        self.budget_guard: Callable[[str], bool] | None = None
+
+    def _record_usage(self, response: object, phase: str) -> None:
+        if self.usage_sink is not None:
+            self.usage_sink(parse_text_usage(response, self.usage_provider, self.model, phase))
 
     def _respond(
-        self, instructions: str, input_text: str, timeout: float = 60.0, retries: int = 1
+        self, instructions: str, input_text: str, timeout: float = 60.0,
+        retries: int = 1, phase: str = "other",
     ) -> str:
+        if self.budget_guard is not None and not self.budget_guard(phase):
+            raise BudgetLimitReached()
         client = (
             self.client.with_options(timeout=timeout, max_retries=retries)
             if hasattr(self.client, "with_options")
@@ -190,6 +203,7 @@ class OpenAITextProcessor:
             input=input_text,
             store=False,
         )
+        self._record_usage(response, phase)
         output = response.output_text.strip()
         if not output:
             raise RuntimeError("文本模型没有返回内容。")
@@ -201,7 +215,7 @@ class OpenAITextProcessor:
 要求：忠实原意，不添加信息；保留数字、公式、代码和单位；技术术语首次出现时可保留英文；
 保持原文段落结构；只输出译文，不要解释。"""
         payload = f"课程领域：{subject}\n术语表：{terminology}\n\n英文课堂原文：\n{text}"
-        return self._respond(instructions, payload)
+        return self._respond(instructions, payload, phase="translation")
 
     def organize(
         self, title: str, subject: str, original: str, translation: str
@@ -214,7 +228,7 @@ class OpenAITextProcessor:
             f"课程名称：{title}\n课程领域：{subject}\n\n"
             f"英文原文：\n{original}\n\n中文译文：\n{translation}"
         )
-        return self._respond(instructions, payload)
+        return self._respond(instructions, payload, phase="organizing")
 
     def summarize_live(
         self,
@@ -227,7 +241,7 @@ class OpenAITextProcessor:
         instructions, payload = _live_summary_request(
             previous, title, subject, original, translation
         )
-        return self._respond(instructions, payload, timeout=15.0, retries=0)
+        return self._respond(instructions, payload, timeout=15.0, retries=0, phase="summary")
 
 
 class CompatibleTextProcessor:
@@ -242,10 +256,20 @@ class CompatibleTextProcessor:
         self.client = client
         self.model = model
         self.extra_body = extra_body or {}
+        self.usage_sink: Callable[[TextUsage], None] | None = None
+        self.usage_provider = "compatible"
+        self.budget_guard: Callable[[str], bool] | None = None
+
+    def _record_usage(self, response: object, phase: str) -> None:
+        if self.usage_sink is not None:
+            self.usage_sink(parse_text_usage(response, self.usage_provider, self.model, phase))
 
     def _respond(
-        self, instructions: str, input_text: str, timeout: float = 60.0, retries: int = 1
+        self, instructions: str, input_text: str, timeout: float = 60.0,
+        retries: int = 1, phase: str = "other",
     ) -> str:
+        if self.budget_guard is not None and not self.budget_guard(phase):
+            raise BudgetLimitReached()
         client = (
             self.client.with_options(timeout=timeout, max_retries=retries)
             if hasattr(self.client, "with_options")
@@ -260,6 +284,7 @@ class CompatibleTextProcessor:
             stream=False,
             extra_body=self.extra_body,
         )
+        self._record_usage(response, phase)
         output = response.choices[0].message.content
         if not output or not output.strip():
             raise RuntimeError("文本服务没有返回内容。")
@@ -271,32 +296,48 @@ class CompatibleTextProcessor:
 要求：忠实原意，不添加信息；保留数字、公式、代码和单位；技术术语首次出现时可保留英文；
 保持原文段落结构；只输出译文，不要解释。"""
         payload = f"课程领域：{subject}\n术语表：{terminology}\n\n英文课堂原文：\n{text}"
-        return self._respond(instructions, payload)
+        return self._respond(instructions, payload, phase="translation")
 
     def translate_stream(
         self, text: str, subject: str, terms: dict[str, str]
     ) -> Iterator[str]:
         """Yield text deltas so the UI can show Chinese before a sentence finishes."""
+        if self.budget_guard is not None and not self.budget_guard("translation"):
+            raise BudgetLimitReached()
         terminology = json.dumps(terms, ensure_ascii=False, separators=(",", ":"))
         instructions = """你是英文课堂实时翻译器。只把当前片段翻译为自然、准确的简体中文。
 不得添加解释或总结；保留数字、单位、公式、代码和专有名词；遵守术语表；只输出译文。"""
         payload = f"课程领域：{subject}\n术语表：{terminology}\n\n当前英文片段：\n{text}"
-        stream = self.client.with_options(timeout=12.0, max_retries=0).chat.completions.create(
-            model=self.model,
-            messages=[
+        request = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": instructions},
                 {"role": "user", "content": payload},
             ],
-            stream=True,
-            max_tokens=max(96, min(512, len(text) * 2)),
-            extra_body=self.extra_body,
+            "stream": True,
+            "max_tokens": max(96, min(512, len(text) * 2)),
+            "extra_body": self.extra_body,
+        }
+        if self.usage_provider == "deepseek":
+            request["stream_options"] = {"include_usage": True}
+        stream = self.client.with_options(timeout=12.0, max_retries=0).chat.completions.create(
+            **request
         )
-        for chunk in stream:
-            if not chunk.choices:
-                continue
-            content = chunk.choices[0].delta.content
-            if content:
-                yield content
+        last_chunk: object | None = None
+        usage_chunk: object | None = None
+        try:
+            for chunk in stream:
+                last_chunk = chunk
+                if getattr(chunk, "usage", None) is not None:
+                    usage_chunk = chunk
+                if not chunk.choices:
+                    continue
+                content = chunk.choices[0].delta.content
+                if content:
+                    yield content
+        finally:
+            if last_chunk is not None:
+                self._record_usage(usage_chunk or last_chunk, "translation")
 
     def organize(
         self, title: str, subject: str, original: str, translation: str
@@ -309,7 +350,7 @@ class CompatibleTextProcessor:
             f"课程名称：{title}\n课程领域：{subject}\n\n"
             f"英文原文：\n{original}\n\n中文译文：\n{translation}"
         )
-        return self._respond(instructions, payload)
+        return self._respond(instructions, payload, phase="organizing")
 
     def summarize_live(
         self,
@@ -322,7 +363,7 @@ class CompatibleTextProcessor:
         instructions, payload = _live_summary_request(
             previous, title, subject, original, translation
         )
-        return self._respond(instructions, payload, timeout=15.0, retries=0)
+        return self._respond(instructions, payload, timeout=15.0, retries=0, phase="summary")
 
 
 def create_text_processor(
@@ -450,10 +491,12 @@ class CoursePipeline:
         transcriber: Transcriber,
         text_processor: TextProcessor,
         progress: ProgressCallback | None = None,
+        usage_provider: str | None = None,
     ):
         self.transcriber = transcriber
         self.text_processor = text_processor
         self.progress = progress or (lambda _: None)
+        self.usage_provider = usage_provider
 
     def run(
         self,
@@ -506,6 +549,10 @@ class CoursePipeline:
 
         result = CourseResult(title, subject, str(audio_path.resolve()), [], "")
         repository.create_course(result, "transcribing")
+        if self.usage_provider:
+            bind_course_usage(
+                self.text_processor, repository, result.id, self.usage_provider
+            )
         try:
             self.progress("正在转写英文音频……")
             result.segments = self.transcriber.transcribe(audio_path, subject)

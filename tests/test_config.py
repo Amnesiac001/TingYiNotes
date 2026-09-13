@@ -45,3 +45,11 @@ def test_settings_has_default_mlx_model(monkeypatch) -> None:
     monkeypatch.delenv("MAC_TRANSCRIPTION_MODEL", raising=False)
     settings = Settings.load()
     assert settings.mac_transcription_model == "mlx-community/whisper-large-v3-turbo"
+
+
+def test_class_budget_configuration_is_optional_and_validated(monkeypatch) -> None:
+    monkeypatch.setenv("CLASSNOTE_CLASS_BUDGET_USD", "0.10")
+    assert Settings.load().class_budget_usd is not None
+    assert str(Settings.load().class_budget_usd) == "0.10"
+    monkeypatch.setenv("CLASSNOTE_CLASS_BUDGET_USD", "invalid")
+    assert Settings.load().class_budget_usd is None

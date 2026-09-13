@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
 
@@ -59,6 +60,7 @@ from .recovery_center import RecoveryCenterDialog
 from .recovery_inventory import list_recovery_candidates
 from .segment_editor import SegmentEditorDialog
 from .subject_terms_dialog import SubjectTermsDialog
+from .usage import format_usage_summary
 from .platforms import (
     IS_APPLE_SILICON,
     IS_MACOS,
@@ -1191,6 +1193,8 @@ class SummaryPane(QFrame):
             self.hint.setText("刚刚更新")
         elif state == "waiting":
             self.hint.setText("等待下次更新")
+        elif state == "paused_budget":
+            self.hint.setText("预算节省中 · 摘要暂停")
 
     def reset(self) -> None:
         self.snapshot = LiveSummarySnapshot()
@@ -1358,12 +1362,19 @@ class LivePage(Page):
         self.drop_quality = QLabel("音频完整")
         self.save_quality = QLabel("已保存 0 句")
         self.save_quality.setToolTip("英文字幕会先写入本地课程库，再开始网络翻译")
+        self.usage_quality = QLabel("文本用量 等待")
+        self.usage_quality.setToolTip("仅统计文本服务返回的 Token；费用为单价快照估算，不含云端语音")
+        self.budget_quality = QLabel("课堂预算 关闭")
+        self.budget_quality.setToolTip("可在设置中开启文本预算；不包含云端语音费用")
+        self.budget_quality.hide()
         for label in (
             self.audio_quality,
             self.asr_quality,
             self.translation_quality,
             self.drop_quality,
             self.save_quality,
+            self.usage_quality,
+            self.budget_quality,
         ):
             label.setObjectName("QualityLabel")
         quality_layout.addWidget(self.record_dot)
@@ -1376,6 +1387,8 @@ class LivePage(Page):
         quality_layout.addWidget(self.translation_quality)
         quality_layout.addWidget(self.drop_quality)
         quality_layout.addWidget(self.save_quality)
+        quality_layout.addWidget(self.usage_quality)
+        quality_layout.addWidget(self.budget_quality)
         quality_layout.addStretch()
         self.quality_strip.hide()
         self.layout.addWidget(self.quality_strip)
@@ -2155,6 +2168,32 @@ class LivePage(Page):
                                 )
         elif name == "summary_status":
             self.summary.set_status(payload)
+        elif name == "usage_update" and isinstance(payload, dict):
+            requests = int(payload.get("requests", 0))
+            cost = payload.get("estimated_cost_usd", 0)
+            unknown = int(payload.get("unknown_requests", 0))
+            unpriced = int(payload.get("unpriced_requests", 0))
+            self.usage_quality.setText(
+                f"文本约 ${cost:.6f}" if requests > unknown + unpriced
+                else f"文本 {requests} 次 · 费用未知"
+            )
+            self.usage_quality.setToolTip(format_usage_summary(payload))
+        elif name == "budget_update" and isinstance(payload, dict):
+            state = str(payload.get("state", ""))
+            limit = payload.get("limit_usd", 0)
+            labels = {
+                "unavailable": "预算 无法核算",
+                "saving": "预算 80% · 摘要暂停",
+                "limit": "预算用完 · 英文继续",
+            }
+            self.budget_quality.show()
+            self.budget_quality.setText(labels.get(state, f"预算 ${limit}"))
+            self.budget_quality.setToolTip(
+                f"文本预算 ${limit}，当前估算 ${payload.get('spent_usd', 0)}。"
+                "并发请求可能产生少量超额；云端语音费用不包含在内。"
+            )
+            if state in {"saving", "limit"}:
+                self.summary.set_status({"state": "paused_budget"})
         elif name == "capture_started":
             self._set_quality_text(self.audio_quality, "音源 已开始采集", COLORS["success"])
             self._set_quality_text(self.asr_quality, "识别 模型准备中")
@@ -2473,6 +2512,10 @@ class LivePage(Page):
         self.unseen_segments = 0
         self.saved_segment_count = 0
         self.save_quality.setText("已保存 0 句")
+        self.usage_quality.setText("文本用量 等待")
+        self.usage_quality.setToolTip("仅统计文本服务返回的 Token；费用为单价快照估算，不含云端语音")
+        self.budget_quality.setText("课堂预算 关闭")
+        self.budget_quality.hide()
         self._sync_marker_controls("")
         self.new_items_button.setText("回到实时")
         self.new_items_button.hide()
@@ -2657,7 +2700,11 @@ class FilePage(Page):
         elif name == "file_finished":
             result, path = payload  # type: ignore[misc]
             self.finish()
-            show_message(self, QMessageBox.Icon.Information, "处理完成", f"《{result.title}》笔记已导出。\n\n文件位置：{path}")
+            usage = self.repository.get_text_usage_summary(result.id)
+            show_message(
+                self, QMessageBox.Icon.Information, "处理完成",
+                f"《{result.title}》笔记已导出。\n\n文件位置：{path}\n\n{format_usage_summary(usage)}",
+            )
         elif name == "file_error":
             self.finish()
             show_message(self, QMessageBox.Icon.Critical, "处理失败", friendly_error(payload))
@@ -2920,11 +2967,15 @@ class LibraryPage(Page):
         if marked_section:
             marked_section = f"---\n\n{marked_section}\n\n"
         transcript_section = "\n\n---\n\n".join(transcript) or "> 没有保存到有效字幕。这通常表示课堂在音频设备或模型启动阶段就已停止。"
+        usage_section = format_usage_summary(
+            self.repository.get_text_usage_summary(str(row["id"]))
+        ).replace("\n", "\n\n")
         self.preview.setMarkdown(
             f"# {row['title']}\n\n"
             f"{row['subject']} · {lifecycle}{issue}\n\n"
             f"---\n\n## 课堂脉络\n\n{topics_section}\n\n"
             f"---\n\n## 整理笔记\n\n{notes_section}\n\n"
+            f"---\n\n## 文本 API 用量\n\n{usage_section}\n\n"
             f"{marked_section}"
             f"---\n\n## 英中对照逐字稿\n\n{transcript_section}"
         )
@@ -3040,6 +3091,25 @@ class SettingsPage(Page):
         text_layout.addWidget(text_hint)
         text_layout.addLayout(text_fields)
         text_layout.addWidget(self.base_url)
+        budget_fields = QHBoxLayout()
+        budget_label = QLabel("单节课文本预算（美元）")
+        budget_label.setObjectName("Muted")
+        self.budget_input = QLineEdit(
+            str(settings.class_budget_usd) if settings.class_budget_usd else ""
+        )
+        self.budget_input.setPlaceholderText("留空或填 0：不限制；例如 0.10")
+        self.budget_input.setToolTip(
+            "达到 80% 暂停实时摘要，达到上限暂停新的文本请求；本地英文继续保存。"
+        )
+        budget_fields.addWidget(budget_label)
+        budget_fields.addWidget(self.budget_input, 1)
+        text_layout.addLayout(budget_fields)
+        budget_hint = QLabel(
+            "预算仅按已返回用量估算文本费用；并发请求可能超额。云端语音不包含在内，未知单价时不执行限额。"
+        )
+        budget_hint.setObjectName("Muted")
+        budget_hint.setWordWrap(True)
+        text_layout.addWidget(budget_hint)
         output_hint = QLabel("笔记输出位置")
         output_hint.setObjectName("Muted")
         output_fields = QHBoxLayout()
@@ -3238,6 +3308,14 @@ class SettingsPage(Page):
             self.base_url.setFocus()
             return
         try:
+            budget = Decimal(self.budget_input.text().strip() or "0")
+        except InvalidOperation:
+            budget = Decimal("-1")
+        if not budget.is_finite() or budget < 0:
+            self.notice.show_notice("课堂文本预算请填写非负美元金额；留空或填 0 表示关闭。", error=True)
+            self.budget_input.setFocus()
+            return
+        try:
             output_dir = self.resolved_output_directory(create=True)
         except (OSError, ValueError) as exc:
             self.notice.show_notice(friendly_error(exc), error=True)
@@ -3264,6 +3342,7 @@ class SettingsPage(Page):
             "TEXT_BASE_URL": base_url if provider == "compatible" else ("https://api.deepseek.com" if provider == "deepseek" else ""),
             "CLASSNOTE_EXPORT_DIR": str(output_dir),
             "CLASSNOTE_TEMP_AUDIO": "true" if self.temporary_audio_check.isChecked() else "false",
+            "CLASSNOTE_CLASS_BUDGET_USD": str(budget),
         }
         try:
             save_env_settings(values)

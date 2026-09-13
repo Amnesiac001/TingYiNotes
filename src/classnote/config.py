@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from dotenv import load_dotenv, set_key
@@ -41,9 +42,16 @@ class Settings:
     text_api_key: str | None
     text_base_url: str | None
     temporary_audio: bool
+    class_budget_usd: Decimal | None = None
 
     @classmethod
     def load(cls) -> "Settings":
+        try:
+            budget = Decimal(os.getenv("CLASSNOTE_CLASS_BUDGET_USD", "0").strip() or "0")
+            if not budget.is_finite() or budget < 0:
+                budget = Decimal("0")
+        except InvalidOperation:
+            budget = Decimal("0")
         provider = os.getenv("TEXT_PROVIDER", "openai").strip().lower()
         openai_key = os.getenv("OPENAI_API_KEY") or None
         if provider == "deepseek":
@@ -83,6 +91,7 @@ class Settings:
             text_base_url=text_base_url,
             temporary_audio=os.getenv("CLASSNOTE_TEMP_AUDIO", "false").strip().lower()
             in {"1", "true", "yes", "on"},
+            class_budget_usd=budget if budget > 0 else None,
         )
 
     def ensure_directories(self) -> None:

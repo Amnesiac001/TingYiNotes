@@ -20,6 +20,7 @@ from .models import CourseResult, Segment
 from .services import create_text_processor
 from .storage import CourseRepository
 from .temporary_audio import finish_temporary_audio, start_temporary_audio
+from .usage import BudgetLimitReached, bind_course_usage
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,10 @@ class RealtimeLiveCourseSession:
             self.settings.text_api_key,
             self.settings.text_base_url,
             self.client if self.settings.text_provider == "openai" else None,
+        )
+        bind_course_usage(
+            self.text_processor, self.repository, self.result.id,
+            self.settings.text_provider, self.event, self.settings.class_budget_usd,
         )
         self.audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=500)
         self.audio_monitor = LiveAudioMonitor(event)
@@ -353,12 +358,16 @@ class RealtimeLiveCourseSession:
         try:
             self.event("status", "正在生成整节课的结构化笔记……")
             self.repository.set_course_state(self.result.id, "organizing")
-            self.result.notes_markdown = self.text_processor.organize(
-                self.title,
-                self.subject,
-                self.result.organized_original_text,
-                self.result.organized_translated_text,
-            )
+            budget_exhausted = False
+            try:
+                self.result.notes_markdown = self.text_processor.organize(
+                    self.title, self.subject,
+                    self.result.organized_original_text,
+                    self.result.organized_translated_text,
+                )
+            except BudgetLimitReached:
+                budget_exhausted = True
+                self.result.notes_markdown = "课后整理因课堂文本预算用完而暂停；英中课堂记录仍在下方。"
             self.repository.save_notes_draft(self.result.id, self.result.notes_markdown)
             topics = [
                 (int(row["start_ms"]), str(row["title"]))
@@ -369,8 +378,12 @@ class RealtimeLiveCourseSession:
                 self.result.id, self.result.notes_markdown, str(path)
             )
             remaining = self.repository.pending_segments(self.result.id)
-            if remaining:
-                message = f"仍有 {len(remaining)} 句中文待补译，英文和当前笔记已保存。"
+            if remaining or budget_exhausted:
+                message = (
+                    f"文本预算已用完；{len(remaining)} 句中文待补译，课后整理可从课程库继续。"
+                    if budget_exhausted else
+                    f"仍有 {len(remaining)} 句中文待补译，英文和当前笔记已保存。"
+                )
                 self.repository.set_course_state(
                     self.result.id, "needs_attention", message, str(path)
                 )

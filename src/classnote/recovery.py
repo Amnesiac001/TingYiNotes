@@ -9,6 +9,7 @@ from .exporter import export_markdown
 from .models import CourseResult, Segment
 from .services import TextProcessor, create_text_processor
 from .storage import CourseRepository
+from .usage import bind_course_usage
 
 
 Progress = Callable[[str], None]
@@ -37,6 +38,7 @@ def recover_course(
         current_settings.text_api_key,
         current_settings.text_base_url,
     )
+    bind_course_usage(processor, repository, course_id, current_settings.text_provider)
     pending = repository.pending_segments(course_id)
     remembered_terms = repository.get_subject_terms(str(row["subject"]))
     repository.set_course_state(course_id, "translating")

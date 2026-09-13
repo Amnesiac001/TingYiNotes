@@ -26,6 +26,7 @@ from .models import CourseResult, Segment
 from .services import OpenAITranscriber, create_text_processor
 from .storage import CourseRepository
 from .temporary_audio import finish_temporary_audio, start_temporary_audio
+from .usage import BudgetLimitReached, bind_course_usage
 
 
 LiveEvent = Callable[[str, object], None]
@@ -423,6 +424,10 @@ class ChunkedLiveCourseSession:
             self.settings.text_base_url,
             self.client if self.settings.text_provider == "openai" else None,
         )
+        bind_course_usage(
+            self.text_processor, self.repository, self.result.id,
+            self.settings.text_provider, self.event, self.settings.class_budget_usd,
+        )
         self.live_summary = LiveSummaryCoordinator(
             self.result, self.text_processor, title, subject, event
         )
@@ -503,12 +508,21 @@ class ChunkedLiveCourseSession:
                 original = " ".join(segment.original_text for segment in segments).strip()
                 if not original:
                     continue
-                translation = self.text_processor.translate(
-                    original, self.subject, relevant_terms(original, self.course_context.terms)
-                )
-                segment = Segment(original, translation, start_ms, end_ms)
+                segment = Segment(original, "", start_ms, end_ms)
                 self.result.segments.append(segment)
-                self.repository.add_segment(self.result.id, segment, len(self.result.segments) - 1)
+                self.repository.add_segment(self.result.id, segment, len(self.result.segments) - 1, "pending")
+                try:
+                    translation = self.text_processor.translate(
+                        original, self.subject, relevant_terms(original, self.course_context.terms)
+                    )
+                except BudgetLimitReached:
+                    self.repository.set_translation_state(
+                        segment.id, "retry", error="课堂文本预算已用完，可课后补译。"
+                    )
+                    self.event("segment", segment)
+                    continue
+                segment.translated_text = translation
+                self.repository.set_translation_state(segment.id, "completed", translation)
                 self.event("segment", segment)
                 self.live_summary.submit(segment)
             except Exception as exc:
@@ -536,12 +550,16 @@ class ChunkedLiveCourseSession:
         try:
             self.event("status", "正在生成整节课的结构化笔记……")
             self.repository.set_course_state(self.result.id, "organizing")
-            self.result.notes_markdown = self.text_processor.organize(
-                self.title,
-                self.subject,
-                self.result.organized_original_text,
-                self.result.organized_translated_text,
-            )
+            budget_exhausted = False
+            try:
+                self.result.notes_markdown = self.text_processor.organize(
+                    self.title, self.subject,
+                    self.result.organized_original_text,
+                    self.result.organized_translated_text,
+                )
+            except BudgetLimitReached:
+                budget_exhausted = True
+                self.result.notes_markdown = "课后整理因课堂文本预算用完而暂停；英中课堂记录仍在下方。"
             self.repository.save_notes_draft(self.result.id, self.result.notes_markdown)
             topics = [
                 (int(row["start_ms"]), str(row["title"]))
@@ -551,6 +569,17 @@ class ChunkedLiveCourseSession:
             self.repository.finalize_course(
                 self.result.id, self.result.notes_markdown, str(path)
             )
+            remaining = self.repository.pending_segments(self.result.id)
+            if remaining or budget_exhausted:
+                message = (
+                    f"文本预算已用完；{len(remaining)} 句中文待补译，可从课程库继续。"
+                    if budget_exhausted else
+                    f"仍有 {len(remaining)} 句中文待补译，可从课程库继续。"
+                )
+                self.repository.set_course_state(
+                    self.result.id, "needs_attention", message, str(path)
+                )
+                self.event("warning", message)
             self.event("finished", (self.result, path))
         except Exception as exc:
             # 分段已安全入库；整理失败不会丢失原文和译文。

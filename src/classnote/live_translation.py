@@ -11,6 +11,7 @@ from .courseware import relevant_terms
 from .models import CourseResult, Segment
 from .services import TextProcessor
 from .storage import CourseRepository
+from .usage import BudgetLimitReached
 
 
 LiveEvent = Callable[[str, object], None]
@@ -222,6 +223,11 @@ class LiveTranslationCoordinator:
             if missing:
                 values = "、".join(sorted(missing)[:5])
                 self.event("warning", f"已保留英文原文；请留意本句中的数字或缩写：{values}")
+        except BudgetLimitReached as exc:
+            self.repository.set_translation_state(segment.id, "retry", error=str(exc))
+            with self._lock:
+                self._retrying_ids.discard(segment.id)
+            self.event("translation_failed", (segment.id, str(exc)))
         except Exception as exc:
             if job.attempt < 1 and not self._closed:
                 self.repository.set_translation_state(segment.id, "retry", error=str(exc))
