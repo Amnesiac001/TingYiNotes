@@ -51,11 +51,44 @@ def test_organized_notes_remain_in_progress_until_export_finishes(tmp_path: Path
     assert draft["notes_markdown"] == "# 已整理但尚未导出"
     assert draft["status"] == "organizing"
     assert draft["export_path"] == ""
+    assert draft["notes_draft_ready"] == 1
 
     repository.finalize_course(result.id, str(draft["notes_markdown"]), "notes.md")
     complete = repository.get_course(result.id)
     assert complete["status"] == "completed"
     assert complete["export_path"] == "notes.md"
+    assert complete["notes_draft_ready"] == 0
+
+
+def test_saved_notes_draft_invalidates_when_class_text_changes(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "draft-invalidated.db")
+    course = CourseResult("课堂", "网络", "mic", [], "")
+    repository.create_course(course)
+    first = Segment("First", "第一", 0, 1000)
+    repository.add_segment(course.id, first, 0, "completed")
+    repository.save_notes_draft(course.id, "# 旧笔记")
+    repository.set_translation_state(first.id, "completed", "新的第一句")
+    assert repository.get_course(course.id)["notes_draft_ready"] == 0
+
+    repository.save_notes_draft(course.id, "# 第二版笔记")
+    repository.add_segment(course.id, Segment("Second", "第二", 1000, 2000), 1, "completed")
+    assert repository.get_course(course.id)["notes_draft_ready"] == 0
+
+    repository.save_notes_draft(course.id, "# 第三版笔记", reusable=False)
+    assert repository.get_course(course.id)["notes_draft_ready"] == 0
+
+    repository.save_notes_draft(course.id, "# 第四版笔记")
+    repository.set_course_state(course.id, "needs_attention")
+    assert repository.correct_segment(
+        course.id, first.id, "First corrected", "新译", "First", "新的第一句",
+    )
+    assert repository.get_course(course.id)["notes_draft_ready"] == 0
+
+    repository.save_notes_draft(course.id, "# 第五版笔记")
+    assert repository.undo_last_segment_correction(
+        course.id, first.id, "First corrected", "新译",
+    )
+    assert repository.get_course(course.id)["notes_draft_ready"] == 0
 
 
 def test_repository_saves_english_before_translation_and_updates_it(tmp_path: Path) -> None:
@@ -143,6 +176,7 @@ def test_repository_migrates_legacy_segments_without_losing_text(tmp_path: Path)
         course = connection.execute("SELECT * FROM courses WHERE id = 'c'").fetchone()
     assert course["status"] == "needs_attention"
     assert course["updated_at"] == "now"
+    assert course["notes_draft_ready"] == 0
 
 
 def test_repository_persists_and_validates_classroom_markers(tmp_path: Path) -> None:
@@ -169,6 +203,32 @@ def test_repository_tracks_lifecycle_and_marks_abandoned_work(tmp_path: Path) ->
     assert row is not None
     assert row["status"] == "interrupted"
     assert "上次退出" in row["error_message"]
+
+
+def test_interrupted_recovery_keeps_finished_translation_and_retries_inflight(
+    tmp_path: Path,
+) -> None:
+    repository = CourseRepository(tmp_path / "interrupted-recovery.db")
+    course = CourseResult("课堂", "网络", "mic", [], "")
+    repository.create_course(course)
+    finished = Segment("First", "第一", 0, 1000)
+    inflight = Segment("Second", "", 1000, 2000)
+    not_started = Segment("Third", "", 2000, 3000)
+    repository.add_segment(course.id, finished, 0, "completed")
+    repository.add_segment(course.id, inflight, 1, "translating")
+    repository.add_segment(course.id, not_started, 2, "retry")
+    repository.set_course_state(course.id, "translating")
+
+    assert repository.mark_active_courses_interrupted() == 1
+    assert repository.get_course(course.id)["status"] == "interrupted"
+    segments = repository.get_course_segments(course.id)
+    assert [item["translation_status"] for item in segments] == [
+        "completed", "retry", "retry",
+    ]
+    assert segments[0]["translated_text"] == "第一"
+    assert [item["original_text"] for item in repository.pending_segments(course.id)] == [
+        "Second", "Third",
+    ]
 
 
 def test_repository_searches_transcript_and_reports_pending(tmp_path: Path) -> None:

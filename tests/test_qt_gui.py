@@ -1,13 +1,19 @@
 import os
+from decimal import Decimal
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtGui import QCloseEvent
 
 from classnote.models import CourseResult, Segment
 from classnote.config import Settings
-from classnote.qt_gui import Bridge, LivePage, SettingsPage, friendly_error
+from classnote.qt_gui import (
+    Bridge, LibraryPage, LivePage, MainWindow, SettingsPage, confirm_course_recovery,
+    confirm_recovery_exit,
+    friendly_error,
+)
 from classnote.storage import CourseRepository
 
 
@@ -21,6 +27,16 @@ def test_friendly_error_distinguishes_invalid_key_from_missing_key() -> None:
     message = friendly_error("401 Invalid API key supplied")
     assert "无效" in message
     assert "尚未配置" not in message
+
+
+def test_recovery_error_keeps_pending_count_and_actionable_cause() -> None:
+    message = friendly_error(
+        "连续 2 句补译失败，已暂停后续请求；仍有 5 句待补译。"
+        "请检查网络、密钥和模型后重试。最近错误：401 Invalid API key"
+    )
+    assert "已暂停后续请求" in message
+    assert "仍有 5 句待补译" in message
+    assert "密钥无效" in message
 
 
 def test_friendly_error_explains_rate_limit() -> None:
@@ -68,6 +84,143 @@ def test_incomplete_class_finish_offers_exact_course_record(monkeypatch, tmp_pat
     assert "待补译：1 句" in prompts[0][1]
     assert "文本预算已用完" in prompts[0][1]
     page.close()
+
+
+def test_course_recovery_confirmation_explains_extra_api_cost(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "confirm.db")
+    captured: dict[str, object] = {}
+
+    def fake_exec(box: QMessageBox) -> QMessageBox.StandardButton:
+        captured["text"] = box.text()
+        captured["detail"] = box.informativeText()
+        captured["default"] = box.defaultButton().text()
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    page = LibraryPage(repository)
+    assert not confirm_course_recovery(
+        page, "物理课", 3,
+        repository.get_text_usage_summary("missing"),
+    )
+    assert "物理课" in captured["text"]
+    assert "补译 3 句" in captured["detail"]
+    assert "不受这节课的文本预算限制" in captured["detail"]
+    assert "额外费用" in captured["detail"]
+    assert captured["default"] == "取消"
+    assert not confirm_course_recovery(
+        page, "物理课", 0,
+        {
+            "requests": 1, "unknown_requests": 0, "unpriced_requests": 0,
+            "input_tokens": 100, "output_tokens": 50,
+            "cached_input_tokens": 0, "estimated_cost_usd": Decimal("0.001"),
+            "phases": {},
+        },
+    )
+    assert "重新整理笔记" in captured["detail"]
+    assert "约 $0.001000" in captured["detail"]
+    assert not confirm_course_recovery(
+        page, "物理课", 0, repository.get_text_usage_summary("missing"),
+        reuse_saved_draft=True,
+    )
+    assert "不会调用文本 API" in captured["detail"]
+    assert "额外费用" not in captured["detail"]
+    page.close()
+    app.processEvents()
+
+
+def test_cancelled_course_recovery_starts_no_worker(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "cancel-recovery.db")
+    segment = Segment("Saved English", "", 0, 1000)
+    result = CourseResult("课", "物理", "mic", [segment], "")
+    repository.create_course(result)
+    repository.add_segment(result.id, segment, 0, "retry")
+    repository.set_course_state(result.id, "needs_attention", "文本预算已用完")
+    page = LibraryPage(repository)
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "classnote.qt_gui.confirm_course_recovery",
+        lambda _parent, title, pending, _usage, **_kwargs:
+            calls.append((title, pending)) or False,
+    )
+    monkeypatch.setattr(
+        "classnote.qt_gui.threading.Thread",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("worker started")),
+    )
+    page.recover_selected()
+    assert calls == [("课", 1)]
+    assert not page._recovery_running
+    assert page.recover_button.isEnabled()
+    assert repository.get_course(result.id)["status"] == "needs_attention"
+    page.close()
+    app.processEvents()
+
+
+def test_library_labels_valid_draft_as_export_only(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "export-only.db")
+    course = CourseResult("课堂", "网络", "mic", [], "")
+    repository.create_course(course)
+    repository.add_segment(course.id, Segment("English", "中文", 0, 1000), 0, "completed")
+    repository.save_notes_draft(course.id, "# 已保存草稿")
+    repository.set_course_state(course.id, "needs_attention", "导出失败")
+
+    page = LibraryPage(repository)
+    assert page.recover_button.isEnabled()
+    assert page.recover_button.text() == "重新导出"
+    assert "不调用文本 API" in page.recover_button.toolTip()
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "classnote.qt_gui.show_message",
+        lambda _parent, _icon, title, body: messages.append((title, body)),
+    )
+    page._recovery_running = True
+    page.handle_recovery_event("finished", (course, tmp_path / "note.md", 0, True))
+    assert messages[0][0] == "笔记已重新导出"
+    assert "保存的草稿" in messages[0][1]
+    page.close()
+    app.processEvents()
+
+
+def test_closing_during_recovery_requires_explicit_exit(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("CLASSNOTE_DB", str(tmp_path / "close-recovery.db"))
+    window = MainWindow()
+    window.library_page._recovery_running = True
+    answers = iter([False, True])
+    monkeypatch.setattr("classnote.qt_gui.confirm_recovery_exit", lambda _parent: next(answers))
+
+    keep_open = QCloseEvent()
+    window.closeEvent(keep_open)
+    assert not keep_open.isAccepted()
+
+    exit_now = QCloseEvent()
+    window.closeEvent(exit_now)
+    assert exit_now.isAccepted()
+    window.library_page._recovery_running = False
+    window.close()
+    app.processEvents()
+
+
+def test_recovery_exit_confirmation_defaults_to_wait(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "exit-confirm.db")
+    page = LibraryPage(repository)
+    captured: dict[str, str] = {}
+
+    def fake_exec(box: QMessageBox) -> QMessageBox.StandardButton:
+        captured["detail"] = box.informativeText()
+        captured["default"] = box.defaultButton().text()
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    assert not confirm_recovery_exit(page)
+    assert "下次打开软件" in captured["detail"]
+    assert "再次请求" in captured["detail"]
+    assert captured["default"] == "继续等待"
+    page.close()
+    app.processEvents()
 
 
 def test_local_speech_openai_text_key_is_visible_and_saved(monkeypatch, tmp_path: Path) -> None:

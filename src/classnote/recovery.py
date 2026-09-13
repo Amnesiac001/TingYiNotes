@@ -32,22 +32,32 @@ def recover_course(
     if not saved:
         raise RuntimeError("这条课程没有可恢复的英文字幕。请重新开始课堂或导入原录音。")
 
-    processor = text_processor or create_text_processor(
-        current_settings.text_provider,
-        current_settings.text_model,
-        current_settings.text_api_key,
-        current_settings.text_base_url,
-    )
-    bind_course_usage(processor, repository, course_id, current_settings.text_provider)
     pending = repository.pending_segments(course_id)
+    saved_draft = (
+        str(row["notes_markdown"]).strip()
+        if not pending and int(row["notes_draft_ready"]) else ""
+    )
+    processor = None
+    if not saved_draft:
+        processor = text_processor or create_text_processor(
+            current_settings.text_provider,
+            current_settings.text_model,
+            current_settings.text_api_key,
+            current_settings.text_base_url,
+        )
+        bind_course_usage(processor, repository, course_id, current_settings.text_provider)
     remembered_terms = repository.get_subject_terms(str(row["subject"]))
-    repository.set_course_state(course_id, "translating")
+    if pending:
+        repository.set_course_state(course_id, "translating")
     failures: list[str] = []
+    consecutive_failures = 0
+    stopped_early = False
     for index, item in enumerate(pending, start=1):
         segment_id = str(item["id"])
         notify(f"正在补译课堂内容…… {index}/{len(pending)}")
         repository.set_translation_state(segment_id, "translating")
         try:
+            assert processor is not None
             translated = processor.translate(
                 str(item["original_text"]), str(row["subject"]),
                 relevant_terms(str(item["original_text"]), remembered_terms),
@@ -55,12 +65,22 @@ def recover_course(
             if not translated:
                 raise RuntimeError("翻译服务没有返回内容。")
             repository.set_translation_state(segment_id, "completed", translated)
+            consecutive_failures = 0
         except Exception as exc:
             repository.set_translation_state(segment_id, "failed", error=str(exc))
             failures.append(str(exc))
+            consecutive_failures += 1
+            if consecutive_failures >= 2:
+                stopped_early = True
+                break
 
     if failures:
-        message = f"仍有 {len(failures)} 句补译失败，请检查网络、密钥和模型后重试。"
+        remaining = len(repository.pending_segments(course_id))
+        message = (
+            f"连续 2 句补译失败，已暂停后续请求；仍有 {remaining} 句待补译。"
+            if stopped_early else f"仍有 {remaining} 句待补译。"
+        )
+        message += f"请检查网络、密钥和模型后重试。最近错误：{failures[-1][:200]}"
         repository.set_course_state(course_id, "needs_attention", message)
         raise RuntimeError(message)
 
@@ -85,16 +105,23 @@ def recover_course(
         id=str(row["id"]),
         created_at=str(row["created_at"]),
     )
-    notify("翻译已补齐，正在重新整理课堂笔记……")
+    notify(
+        "已找到保存的课堂笔记，正在重新导出……" if saved_draft
+        else "翻译已补齐，正在重新整理课堂笔记……"
+    )
     repository.set_course_state(course_id, "organizing")
     try:
-        result.notes_markdown = processor.organize(
-            result.title,
-            result.subject,
-            result.organized_original_text,
-            result.organized_translated_text,
-        )
-        repository.save_notes_draft(course_id, result.notes_markdown)
+        if saved_draft:
+            result.notes_markdown = saved_draft
+        else:
+            assert processor is not None
+            result.notes_markdown = processor.organize(
+                result.title,
+                result.subject,
+                result.organized_original_text,
+                result.organized_translated_text,
+            )
+            repository.save_notes_draft(course_id, result.notes_markdown)
         topics = [
             (int(topic["start_ms"]), str(topic["title"]))
             for topic in repository.get_course_topics(course_id)

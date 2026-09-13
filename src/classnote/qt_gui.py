@@ -189,6 +189,9 @@ class RuntimeCheckBridge(QObject):
 def friendly_error(error: object) -> str:
     """Turn provider/runtime exceptions into short, actionable Chinese messages."""
     message = str(error).strip()
+    if message.startswith(("连续 2 句补译失败", "仍有 ")) and "最近错误：" in message:
+        summary, _, cause = message.partition("最近错误：")
+        return f"{summary}最近错误：{friendly_error(cause)}"
     lowered = message.lower()
     if "401" in lowered or "unauthorized" in lowered or "invalid api" in lowered:
         return "API 密钥无效或已失效。请检查密钥是否完整，并确认对应账户可以使用当前模型。"
@@ -261,6 +264,57 @@ def confirm_course_delete(parent: QWidget, title: str, segment_count: int) -> bo
     box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
     box.button(QMessageBox.StandardButton.Yes).setText("删除记录")
     box.button(QMessageBox.StandardButton.No).setText("取消")
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    return box.exec() == QMessageBox.StandardButton.Yes
+
+
+def confirm_course_recovery(
+    parent: QWidget, title: str, pending_count: int, usage_summary: dict[str, object],
+    *, reuse_saved_draft: bool = False,
+) -> bool:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle("确认重新导出" if reuse_saved_draft else "确认课后补译")
+    box.setText(f"继续处理《{title}》吗？")
+    if reuse_saved_draft and not pending_count:
+        box.setInformativeText(
+            "已保存的课堂笔记仍有效，这次只重新导出文件，不会调用文本 API 或重新转写音频。"
+            "如果目标位置已有同名笔记，导出时会更新该文件。"
+        )
+    else:
+        task = f"补译 {pending_count} 句英文并重新整理笔记" if pending_count else "重新整理笔记"
+        usage_lines = format_usage_summary(usage_summary).splitlines()
+        previous = usage_lines[0]
+        cost_line = next(
+            (line for line in usage_lines if line.startswith(("按官方单价", "费用尚无法估算"))),
+            "",
+        )
+        if cost_line:
+            previous += f"\n{cost_line}"
+        box.setInformativeText(
+            f"将使用设置中当前选择的文本 API {task}，可能产生额外费用。"
+            "课后处理不受这节课的文本预算限制；不会重新转写音频。\n\n"
+            f"本节已记录：{previous}\n实际费用请以服务商账单为准。"
+        )
+    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    box.button(QMessageBox.StandardButton.Yes).setText("继续处理")
+    box.button(QMessageBox.StandardButton.No).setText("取消")
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    return box.exec() == QMessageBox.StandardButton.Yes
+
+
+def confirm_recovery_exit(parent: QWidget) -> bool:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle("课后补译仍在进行")
+    box.setText("现在关闭会中断正在进行的补译和整理。")
+    box.setInformativeText(
+        "已保存的英文和已完成的中文会保留；下次打开软件可从课程库继续。"
+        "正在处理的一次 API 请求可能已经计费，但结果尚未写入记录，重试时可能再次请求。"
+    )
+    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    box.button(QMessageBox.StandardButton.Yes).setText("退出并保留记录")
+    box.button(QMessageBox.StandardButton.No).setText("继续等待")
     box.setDefaultButton(QMessageBox.StandardButton.No)
     return box.exec() == QMessageBox.StandardButton.Yes
 
@@ -2852,7 +2906,13 @@ class LibraryPage(Page):
                 or str(row["status"]) in {"needs_attention", "interrupted", "failed"}
             )
             self.recover_button.setText(
-                "补译并整理" if int(row["pending_count"]) else "重新整理"
+                "补译并整理" if int(row["pending_count"])
+                else "重新导出" if int(row["notes_draft_ready"]) else "重新整理"
+            )
+            self.recover_button.setToolTip(
+                "只导出已保存的课堂笔记，不调用文本 API"
+                if not int(row["pending_count"]) and int(row["notes_draft_ready"])
+                else "补译失败或中断的句子，并重新生成课堂笔记"
             )
         self.recover_button.setEnabled(recoverable and not self._recovery_running)
         self.edit_button.setEnabled(editable and not self._recovery_running)
@@ -2903,12 +2963,24 @@ class LibraryPage(Page):
             return
         row = self.rows[index]
         course_id = str(row["id"])
+        export_only = not int(row["pending_count"]) and bool(row["notes_draft_ready"])
+        if not confirm_course_recovery(
+            self, str(row["title"]), int(row["pending_count"]),
+            self.repository.get_text_usage_summary(course_id),
+            reuse_saved_draft=export_only,
+        ):
+            return
         self._recovery_running = True
         self.recover_button.setEnabled(False)
         self.edit_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.preview.setMarkdown(
-            f"# {row['title']}\n\n正在补译和重新整理，请不要关闭软件……"
+            f"# {row['title']}\n\n"
+            + (
+                "正在重新导出已保存的课堂笔记，请不要关闭软件……"
+                if export_only
+                else "正在补译和重新整理，请不要关闭软件……"
+            )
         )
 
         def worker() -> None:
@@ -2920,7 +2992,7 @@ class LibraryPage(Page):
                     self.repository,
                     progress=lambda message: self.recovery_event.emit("progress", message),
                 )
-                self.recovery_event.emit("finished", (result, path, index))
+                self.recovery_event.emit("finished", (result, path, index, export_only))
             except Exception as exc:
                 self.recovery_event.emit("error", (str(exc), index))
 
@@ -2934,13 +3006,15 @@ class LibraryPage(Page):
             return
         self._recovery_running = False
         if name == "finished":
-            result, path, index = payload  # type: ignore[misc]
+            result, path, index, export_only = payload  # type: ignore[misc]
             self.reload(preferred_index=int(index))
             show_message(
                 self,
                 QMessageBox.Icon.Information,
-                "课程已恢复",
-                f"《{result.title}》已经补译并重新整理。\n\n笔记位置：{path}",
+                "笔记已重新导出" if export_only else "课程已恢复",
+                f"《{result.title}》"
+                + ("已用保存的草稿重新导出。" if export_only else "已经补译并重新整理。")
+                + f"\n\n笔记位置：{path}",
             )
             return
         message, index = payload  # type: ignore[misc]
@@ -3627,6 +3701,9 @@ class MainWindow(QMainWindow):
                 return
             self._close_after_session = True
             self.live_page.stop(confirmed=True)
+            event.ignore()
+            return
+        if self.library_page._recovery_running and not confirm_recovery_exit(self):
             event.ignore()
             return
         event.accept()

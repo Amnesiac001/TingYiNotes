@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS courses (
     status TEXT NOT NULL DEFAULT 'completed',
     updated_at TEXT NOT NULL DEFAULT '',
     error_message TEXT NOT NULL DEFAULT '',
-    export_path TEXT NOT NULL DEFAULT ''
+    export_path TEXT NOT NULL DEFAULT '',
+    notes_draft_ready INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS segments (
     id TEXT PRIMARY KEY,
@@ -225,6 +226,7 @@ class CourseRepository:
                 "updated_at": "ALTER TABLE courses ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
                 "error_message": "ALTER TABLE courses ADD COLUMN error_message TEXT NOT NULL DEFAULT ''",
                 "export_path": "ALTER TABLE courses ADD COLUMN export_path TEXT NOT NULL DEFAULT ''",
+                "notes_draft_ready": "ALTER TABLE courses ADD COLUMN notes_draft_ready INTEGER NOT NULL DEFAULT 0",
             }
             for column, statement in course_migrations.items():
                 if column not in course_columns:
@@ -417,6 +419,9 @@ class CourseRepository:
                     sort_order,
                 ),
             )
+            connection.execute(
+                "UPDATE courses SET notes_draft_ready = 0 WHERE id = ?", (course_id,)
+            )
 
     def set_segment_marker(self, segment_id: str, marker: str) -> None:
         if marker not in {"", "important", "question"}:
@@ -491,7 +496,8 @@ class CourseRepository:
             connection.execute(
                 """UPDATE courses
                    SET status = 'needs_attention', updated_at = ?,
-                       error_message = '字幕已人工校对，整理笔记可能过时；请在课程库重新整理。'
+                       error_message = '字幕已人工校对，整理笔记可能过时；请在课程库重新整理。',
+                       notes_draft_ready = 0
                    WHERE id = ?""",
                 (utc_now(), course_id),
             )
@@ -553,7 +559,8 @@ class CourseRepository:
             connection.execute("DELETE FROM segment_corrections WHERE id = ?", (revision["id"],))
             connection.execute(
                 """UPDATE courses SET status = 'needs_attention', updated_at = ?,
-                   error_message = '字幕校对已撤销，整理笔记可能过时；请在课程库重新整理。'
+                   error_message = '字幕校对已撤销，整理笔记可能过时；请在课程库重新整理。',
+                   notes_draft_ready = 0
                    WHERE id = ?""",
                 (utc_now(), course_id),
             )
@@ -580,6 +587,11 @@ class CourseRepository:
                        WHERE id = ?""",
                     (translated_text, status, error, segment_id),
                 )
+                connection.execute(
+                    """UPDATE courses SET notes_draft_ready = 0
+                       WHERE id = (SELECT course_id FROM segments WHERE id = ?)""",
+                    (segment_id,),
+                )
 
     def pending_segments(self, course_id: str) -> list[sqlite3.Row]:
         with self.connect() as connection:
@@ -603,17 +615,21 @@ class CourseRepository:
             connection.execute(
                 """UPDATE courses
                    SET notes_markdown = ?, status = 'completed', updated_at = ?,
-                       error_message = '', export_path = CASE WHEN ? <> '' THEN ? ELSE export_path END
+                       error_message = '', notes_draft_ready = 0,
+                       export_path = CASE WHEN ? <> '' THEN ? ELSE export_path END
                    WHERE id = ?""",
                 (notes_markdown, utc_now(), export_path, export_path, course_id),
             )
 
-    def save_notes_draft(self, course_id: str, notes_markdown: str) -> None:
+    def save_notes_draft(
+        self, course_id: str, notes_markdown: str, *, reusable: bool = True
+    ) -> None:
         """Keep organized notes recoverable until their file export succeeds."""
         with self.connect() as connection:
             connection.execute(
-                "UPDATE courses SET notes_markdown = ?, updated_at = ? WHERE id = ?",
-                (notes_markdown, utc_now(), course_id),
+                """UPDATE courses SET notes_markdown = ?, notes_draft_ready = ?,
+                   updated_at = ? WHERE id = ?""",
+                (notes_markdown, int(reusable), utc_now(), course_id),
             )
 
     def count_courses(self) -> int:

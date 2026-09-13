@@ -601,7 +601,9 @@ class LocalLiveCourseSession:
             except BudgetLimitReached:
                 budget_exhausted = True
                 self.result.notes_markdown = "课后整理因课堂文本预算用完而暂停；英中课堂记录仍在下方。"
-            self.repository.save_notes_draft(self.result.id, self.result.notes_markdown)
+            self.repository.save_notes_draft(
+                self.result.id, self.result.notes_markdown, reusable=not budget_exhausted
+            )
             topics = [
                 (int(row["start_ms"]), str(row["title"]))
                 for row in self.repository.get_course_topics(self.result.id)
