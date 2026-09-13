@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -8,7 +10,66 @@ from pathlib import Path
 from dotenv import load_dotenv, set_key
 
 
-load_dotenv()
+def application_data_dir() -> Path:
+    """Stable per-user location for installed or frozen applications."""
+    if sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+        preferred, legacy = root / "听译记", root / "ClassNote"
+        return legacy if legacy.exists() and not preferred.exists() else preferred
+    if os.name == "nt":
+        root = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return root / "听译记"
+    root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return root / "tingyiji"
+
+
+def settings_env_path() -> Path:
+    """Use the project .env in a checkout, or user data in an installed app."""
+    explicit = os.environ.get("CLASSNOTE_ENV_FILE")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    if not getattr(sys, "frozen", False):
+        project_root = Path(__file__).resolve().parents[2]
+        if (project_root / "pyproject.toml").is_file() and (project_root / ".env.example").is_file():
+            return project_root / ".env"
+    return application_data_dir() / ".env"
+
+
+def _data_path(raw: str, config_dir: Path) -> Path:
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else (config_dir / path).resolve()
+
+
+load_dotenv(settings_env_path(), override=False)
+
+
+def verify_output_directory(path: Path) -> Path:
+    """Check the same create/write/replace operations used by Markdown export."""
+    target = path.expanduser().resolve()
+    if target.exists() and not target.is_dir():
+        raise ValueError("笔记输出位置必须是文件夹，不能是文件。")
+    temporary_paths: list[Path] = []
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=target, prefix=".tingyiji-write-check-",
+                suffix=".tmp", delete=False,
+            ) as temporary:
+                temporary_paths.append(Path(temporary.name))
+                temporary.write(b"write-check")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+        os.replace(temporary_paths[0], temporary_paths[1])
+    except OSError as exc:
+        raise OSError(f"笔记输出位置不可写：{target}。请换一个有写入权限的文件夹。原因：{exc}") from exc
+    finally:
+        for temporary_path in temporary_paths:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return target
 
 
 def _provider_setting(name: str, legacy: str | None = None) -> str | None:
@@ -18,7 +79,8 @@ def _provider_setting(name: str, legacy: str | None = None) -> str | None:
 
 def save_env_settings(values: dict[str, str], path: Path | None = None) -> Path:
     """Persist GUI settings without making users edit dotenv syntax manually."""
-    env_path = (path or Path(".env")).resolve()
+    env_path = (path or settings_env_path()).expanduser().resolve()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
     if not env_path.exists():
         env_path.touch()
     for key, value in values.items():
@@ -51,6 +113,7 @@ class Settings:
 
     @classmethod
     def load(cls) -> "Settings":
+        env_path = settings_env_path()
         try:
             budget = Decimal(os.getenv("CLASSNOTE_CLASS_BUDGET_USD", "0").strip() or "0")
             if not budget.is_finite() or budget < 0:
@@ -82,8 +145,8 @@ class Settings:
             api_key=openai_key,
             transcription_model=os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe"),
             text_model=os.getenv(model_key) or os.getenv("TEXT_MODEL") or default_text_model,
-            database_path=Path(os.getenv("CLASSNOTE_DB", "data/classnote.db")),
-            export_dir=Path(os.getenv("CLASSNOTE_EXPORT_DIR", "exports")),
+            database_path=_data_path(os.getenv("CLASSNOTE_DB", "data/classnote.db"), env_path.parent),
+            export_dir=_data_path(os.getenv("CLASSNOTE_EXPORT_DIR", "exports"), env_path.parent),
             live_chunk_seconds=max(5, int(os.getenv("LIVE_CHUNK_SECONDS", "10"))),
             live_mode=os.getenv("LIVE_MODE", "local").strip().lower(),
             live_transcription_model=os.getenv(

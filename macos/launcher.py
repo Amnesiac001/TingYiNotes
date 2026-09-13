@@ -1,13 +1,11 @@
 import os
 import sys
-from pathlib import Path
+
+from classnote.config import application_data_dir
 
 
 if getattr(sys, "frozen", False):
-    application_support = Path.home() / "Library" / "Application Support"
-    preferred = application_support / "听译记"
-    legacy = application_support / "ClassNote"
-    app_data = legacy if legacy.exists() and not preferred.exists() else preferred
+    app_data = application_data_dir()
     app_data.mkdir(parents=True, exist_ok=True)
     os.chdir(app_data)
 

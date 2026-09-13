@@ -1,6 +1,7 @@
 import os
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -10,7 +11,7 @@ from PySide6.QtGui import QCloseEvent
 from classnote.models import CourseResult, Segment
 from classnote.config import Settings
 from classnote.qt_gui import (
-    Bridge, LibraryPage, LivePage, MainWindow, SettingsPage, confirm_course_recovery,
+    Bridge, FilePage, LibraryPage, LivePage, MainWindow, SettingsPage, confirm_course_recovery,
     confirm_recovery_exit,
     friendly_error,
 )
@@ -43,6 +44,19 @@ def test_friendly_error_explains_rate_limit() -> None:
     message = friendly_error("Error code: 429 rate limit exceeded")
     assert "频繁" in message
     assert "额度" in message
+
+
+def test_friendly_error_does_not_confuse_api_permission_with_microphone() -> None:
+    message = friendly_error("403 PermissionDeniedError: model access denied")
+    assert "文本服务" in message
+    assert "麦克风" not in message
+    assert "模型" in message
+
+
+def test_friendly_error_distinguishes_spend_limit_from_rate_limit() -> None:
+    message = friendly_error("429 project_spend_limit_exceeded")
+    assert "支出上限" in message
+    assert "稍后重试" not in message
 
 
 def test_friendly_error_preserves_unknown_details() -> None:
@@ -340,4 +354,131 @@ def test_cloud_speech_and_openai_text_can_share_one_key(monkeypatch, tmp_path: P
     assert settings.api_key == "shared-openai-key"
     assert settings.text_api_key == "shared-openai-key"
     page.close()
+    app.processEvents()
+
+
+def test_text_connection_check_uses_unsaved_deepseek_fields(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("TEXT_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    page = SettingsPage(Settings.load())
+    page.text_key.setText("sk-unsaved-test")
+    page.text_model.setCurrentText("custom-test-model")
+    calls: list[tuple[str, str, str, str | None]] = []
+
+    def fake_probe(provider: str, model: str, key: str, base_url: str | None):
+        from classnote.text_preflight import TextProbeResult
+
+        calls.append((provider, model, key, base_url))
+        return TextProbeResult(42, "OK")
+
+    class ImmediateThread:
+        def __init__(self, *, target, args, **_kwargs) -> None:
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            self.target(*self.args)
+
+    monkeypatch.setattr("classnote.text_preflight.probe_text_connection", fake_probe)
+    monkeypatch.setattr("classnote.qt_gui.threading.Thread", ImmediateThread)
+    page.test_text_connection()
+    app.processEvents()
+    assert calls == [
+        ("deepseek", "custom-test-model", "sk-unsaved-test", "https://api.deepseek.com")
+    ]
+    assert "连接成功" in page.text_connection_status.text()
+    assert page.test_text_button.isEnabled()
+    page.close()
+
+
+def test_text_connection_check_requires_key_and_rejects_stale_result(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("TEXT_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    page = SettingsPage(Settings.load())
+    page.text_key.clear()
+    page.test_text_connection()
+    assert page.test_text_button.isEnabled()
+
+    page.text_key.setText("sk-test")
+    pending: list[tuple[object, tuple[object, ...]]] = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args, **_kwargs) -> None:
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            pending.append((self.target, self.args))
+
+    from classnote.text_preflight import TextProbeResult
+
+    monkeypatch.setattr("classnote.qt_gui.threading.Thread", DeferredThread)
+    monkeypatch.setattr(
+        "classnote.text_preflight.probe_text_connection",
+        lambda *_args: TextProbeResult(9, "OK"),
+    )
+    page.test_text_connection()
+    assert not page.test_text_button.isEnabled()
+    page.text_model.setCurrentText("different-model")
+    target, args = pending.pop()
+    target(*args)
+    app.processEvents()
+    assert "配置已修改" in page.text_connection_status.text()
+    assert page.test_text_button.isEnabled()
+    page.close()
+
+
+def test_settings_refuses_unwritable_output_before_saving(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("TEXT_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("LIVE_MODE", "local")
+    page = SettingsPage(Settings.load())
+    page.output_dir.setText(str(tmp_path / "unwritable"))
+    monkeypatch.setattr(
+        "classnote.qt_gui.verify_output_directory",
+        lambda _path: (_ for _ in ()).throw(OSError("笔记输出位置不可写")),
+    )
+    monkeypatch.setattr(
+        "classnote.qt_gui.save_env_settings",
+        lambda _values: (_ for _ in ()).throw(AssertionError("settings saved")),
+    )
+    page.save()
+    assert "笔记输出位置不可写" in page.notice.text.text()
+    page.close()
+    app.processEvents()
+
+
+def test_live_and_file_processing_check_output_before_start(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("CLASSNOTE_DB", str(tmp_path / "output-check.db"))
+    monkeypatch.setenv("TEXT_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("LIVE_MODE", "local")
+    window = MainWindow()
+    live = window.live_page
+    live.devices = [SimpleNamespace(is_loopback=False)]
+    live.device_combo.clear()
+    live.device_combo.addItem("测试麦克风")
+    monkeypatch.setattr(
+        "classnote.qt_gui.verify_output_directory",
+        lambda _path: (_ for _ in ()).throw(OSError("笔记输出位置不可写")),
+    )
+    live.start()
+    assert live.session is None
+    assert "笔记输出位置不可写" in live.notice.text.text()
+
+    file_page = FilePage(Bridge(), window.repository)
+    messages: list[str] = []
+    monkeypatch.setattr(
+        "classnote.qt_gui.show_message",
+        lambda _parent, _icon, _title, body: messages.append(body),
+    )
+    file_page.start(demo=True)
+    assert messages == ["笔记输出位置不可写"]
+    assert file_page.start_button.isEnabled()
+    file_page.close()
+    window.close()
     app.processEvents()

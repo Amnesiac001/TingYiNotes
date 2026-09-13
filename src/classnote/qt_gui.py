@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
 
 from .app import process_course
 from .branding import APP_NAME, APP_TITLE
-from .config import Settings, save_env_settings
+from .config import Settings, save_env_settings, verify_output_directory
 from .courseware import CourseContext, build_course_context, merge_subject_context
 from .live import AudioDevice, AudioLevelResult, LiveCourseSession, capture_audio_level, list_input_devices
 from .live_summary import LiveSummarySnapshot
@@ -195,10 +195,17 @@ def friendly_error(error: object) -> str:
     lowered = message.lower()
     if "401" in lowered or "unauthorized" in lowered or "invalid api" in lowered:
         return "API 密钥无效或已失效。请检查密钥是否完整，并确认对应账户可以使用当前模型。"
-    if "openai_api_key" in lowered or "api key" in lowered or "api_key" in lowered:
-        return "尚未配置所需 API Key。请在“设置”中填写并保存；云端语音需要 OPENAI_API_KEY。"
+    if any(code in lowered for code in (
+        "credit_balance_exhausted", "insufficient_quota", "spend_limit_exceeded",
+        "usage_limit_exceeded",
+    )):
+        return "文本服务额度或支出上限已用完。请检查服务商的账单与账户限制，调整后再测试。"
+    if "403" in lowered or "permissiondeniederror" in lowered:
+        return "文本服务拒绝访问（403）。请检查服务地区、API Key 所属账户及当前模型的使用权限。"
     if "429" in lowered or "rate limit" in lowered:
         return "服务请求过于频繁或账户额度不足。课堂内容不会因此被删除，请稍后重试或检查账户余额。"
+    if "openai_api_key" in lowered or "api key" in lowered or "api_key" in lowered:
+        return "尚未配置所需 API Key。请在“设置”中填写并保存；云端语音需要 OPENAI_API_KEY。"
     if "timeout" in lowered or "timed out" in lowered:
         return "连接服务超时。请检查网络，稍后重试；如果正在上课，建议先保留当前记录。"
     if "connection" in lowered or "network" in lowered:
@@ -213,7 +220,10 @@ def friendly_error(error: object) -> str:
             if IS_MACOS
             else "音频设备正被其他程序独占。请关闭占用它的软件，或在 Windows 声音设置中关闭独占模式。"
         )
-    if "permission" in lowered or "access denied" in lowered or "not permitted" in lowered:
+    if (
+        ("permission" in lowered or "access denied" in lowered or "not permitted" in lowered)
+        and ("microphone" in lowered or "audio input" in lowered or "input device" in lowered)
+    ):
         return f"没有麦克风访问权限。{microphone_permission_hint()}"
     if "invalid sample rate" in lowered or "-9997" in lowered:
         return "麦克风不支持请求的采样率。请刷新设备后重试；软件将使用麦克风原生采样率并自动转换。"
@@ -2108,6 +2118,11 @@ class LivePage(Page):
             )
             return
         try:
+            verify_output_directory(current_settings.export_dir)
+        except (OSError, ValueError) as exc:
+            self.notice.show_notice(friendly_error(exc), "前往设置", error=True)
+            return
+        try:
             self.clear_session_content()
             self.session = LiveCourseSession(
                 self.title_input.text().strip() or "英语课堂",
@@ -2764,6 +2779,11 @@ class FilePage(Page):
         if not demo and not self.path:
             show_message(self, QMessageBox.Icon.Warning, "还没有选择文件", "请把课堂录音拖到上方区域，或者点击该区域选择文件。")
             return
+        try:
+            verify_output_directory(Settings.load().export_dir)
+        except (OSError, ValueError) as exc:
+            show_message(self, QMessageBox.Icon.Warning, "无法保存课堂笔记", friendly_error(exc))
+            return
         self.start_button.setEnabled(False)
         self.demo_button.setEnabled(False)
         self.progress.show()
@@ -3106,6 +3126,9 @@ class SettingsPage(Page):
         self.settings = settings
         self.runtime_check = RuntimeCheckBridge(self)
         self.runtime_check.finished.connect(self.local_runtime_finished)
+        self.text_check = RuntimeCheckBridge(self)
+        self.text_check.finished.connect(self.text_connection_finished)
+        self._text_probe_snapshot: tuple[str, str, str, str | None] | None = None
         self.notice = NoticeBar()
         self.layout.addWidget(self.notice)
 
@@ -3226,6 +3249,16 @@ class SettingsPage(Page):
         text_layout.addWidget(text_hint)
         text_layout.addLayout(text_fields)
         text_layout.addWidget(self.base_url)
+        text_check_row = QHBoxLayout()
+        self.text_connection_status = QLabel("测试会发送一条短请求，可能产生少量文本 API 费用；不会保存当前输入。")
+        self.text_connection_status.setObjectName("Muted")
+        self.text_connection_status.setWordWrap(True)
+        self.test_text_button = QPushButton("测试文本连接")
+        self.test_text_button.setToolTip("用当前 Key、模型和地址发送一次短请求；不自动重试，也不保存设置")
+        self.test_text_button.clicked.connect(self.test_text_connection)
+        text_check_row.addWidget(self.text_connection_status, 1)
+        text_check_row.addWidget(self.test_text_button)
+        text_layout.addLayout(text_check_row)
         budget_fields = QHBoxLayout()
         budget_label = QLabel("单节课文本预算（美元）")
         budget_label.setObjectName("Muted")
@@ -3327,6 +3360,70 @@ class SettingsPage(Page):
             self.text_key.setPlaceholderText("粘贴 DeepSeek API Key（sk-...）")
         elif provider == "compatible":
             self.text_key.setPlaceholderText("粘贴兼容服务 API Key；本地服务可填写 local")
+
+    def _text_probe_values(self) -> tuple[str, str, str, str | None]:
+        provider = self.PROVIDERS[self.provider.currentText()]
+        model = self.text_model.currentText().strip()
+        key = self.text_key.text().strip()
+        if provider == "openai" and not key:
+            key = self.speech_key.text().strip()
+        base_url = (
+            self.base_url.text().strip() if provider == "compatible"
+            else "https://api.deepseek.com" if provider == "deepseek" else None
+        )
+        return provider, model, key, base_url
+
+    def test_text_connection(self) -> None:
+        if not self.test_text_button.isEnabled():
+            return
+        provider, model, key, base_url = self._text_probe_values()
+        if not model:
+            self.notice.show_notice("请先选择或填写一个文本模型。", error=True)
+            self.text_model.setFocus()
+            return
+        if not key:
+            self.notice.show_notice("请先填写当前文本服务的 API Key。", error=True)
+            self.text_key.setFocus()
+            return
+        if provider == "compatible" and not base_url:
+            self.notice.show_notice("请先填写兼容服务地址。", error=True)
+            self.base_url.setFocus()
+            return
+        self._text_probe_snapshot = (provider, model, key, base_url)
+        self.test_text_button.setEnabled(False)
+        self.text_connection_status.setText("正在测试连接；可继续查看设置，请稍候……")
+        threading.Thread(
+            target=self._run_text_probe,
+            args=(provider, model, key, base_url),
+            name="classnote-text-preflight",
+            daemon=True,
+        ).start()
+
+    def _run_text_probe(
+        self, provider: str, model: str, key: str, base_url: str | None
+    ) -> None:
+        try:
+            from .text_preflight import probe_text_connection
+
+            result = probe_text_connection(provider, model, key, base_url)
+            self.text_check.finished.emit(
+                True, f"{provider} · {model}", f"连接成功 · 约 {result.latency_ms} ms",
+            )
+        except Exception as exc:
+            self.text_check.finished.emit(False, f"{provider} · {model}", friendly_error(exc))
+
+    def text_connection_finished(self, success: bool, detail: str, message: str) -> None:
+        self.test_text_button.setEnabled(True)
+        if self._text_probe_snapshot != self._text_probe_values():
+            self.text_connection_status.setText("测试期间配置已修改，请重新测试当前设置。")
+            self.notice.show_notice("刚才的测试结果不对应当前输入，请重新测试。", error=True)
+            return
+        self.text_connection_status.setText(f"{detail} · {message}")
+        self.notice.show_notice(
+            f"文本服务{message}。测试不保存配置；请点击“保存并应用”。"
+            if success else f"文本服务测试失败：{message}",
+            error=not success,
+        )
 
     def test_local_runtime(self) -> None:
         if IS_MACOS:
@@ -3460,7 +3557,7 @@ class SettingsPage(Page):
             self.budget_input.setFocus()
             return
         try:
-            output_dir = self.resolved_output_directory(create=True)
+            output_dir = verify_output_directory(self.resolved_output_directory(create=True))
         except (OSError, ValueError) as exc:
             self.notice.show_notice(friendly_error(exc), error=True)
             self.output_dir.setFocus()
