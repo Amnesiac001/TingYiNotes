@@ -11,6 +11,11 @@ from dotenv import load_dotenv, set_key
 load_dotenv()
 
 
+def _provider_setting(name: str, legacy: str | None = None) -> str | None:
+    """An explicit empty provider slot must not fall back to another provider's old key."""
+    return (os.environ.get(name) or None) if name in os.environ else legacy
+
+
 def save_env_settings(values: dict[str, str], path: Path | None = None) -> Path:
     """Persist GUI settings without making users edit dotenv syntax manually."""
     env_path = (path or Path(".env")).resolve()
@@ -55,21 +60,28 @@ class Settings:
         provider = os.getenv("TEXT_PROVIDER", "openai").strip().lower()
         openai_key = os.getenv("OPENAI_API_KEY") or None
         if provider == "deepseek":
-            text_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("TEXT_API_KEY") or None
+            text_key = _provider_setting("DEEPSEEK_API_KEY", os.getenv("TEXT_API_KEY") or None)
             text_base_url = os.getenv("TEXT_BASE_URL", "https://api.deepseek.com")
             default_text_model = "deepseek-v4-flash"
         elif provider == "compatible":
-            text_key = os.getenv("TEXT_API_KEY") or None
-            text_base_url = os.getenv("TEXT_BASE_URL") or None
+            text_key = _provider_setting("COMPATIBLE_API_KEY", os.getenv("TEXT_API_KEY") or None)
+            text_base_url = _provider_setting("COMPATIBLE_BASE_URL", os.getenv("TEXT_BASE_URL") or None)
             default_text_model = ""
         else:
-            text_key = os.getenv("TEXT_API_KEY") or openai_key
+            text_key = _provider_setting(
+                "OPENAI_TEXT_API_KEY", os.getenv("TEXT_API_KEY") or openai_key
+            ) or openai_key
             text_base_url = os.getenv("TEXT_BASE_URL") or None
             default_text_model = "gpt-5-mini"
+        model_key = {
+            "openai": "OPENAI_TEXT_MODEL",
+            "deepseek": "DEEPSEEK_TEXT_MODEL",
+            "compatible": "COMPATIBLE_TEXT_MODEL",
+        }.get(provider, "TEXT_MODEL")
         return cls(
             api_key=openai_key,
             transcription_model=os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe"),
-            text_model=os.getenv("TEXT_MODEL") or default_text_model,
+            text_model=os.getenv(model_key) or os.getenv("TEXT_MODEL") or default_text_model,
             database_path=Path(os.getenv("CLASSNOTE_DB", "data/classnote.db")),
             export_dir=Path(os.getenv("CLASSNOTE_EXPORT_DIR", "exports")),
             live_chunk_seconds=max(5, int(os.getenv("LIVE_CHUNK_SECONDS", "10"))),

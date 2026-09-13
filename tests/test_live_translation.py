@@ -143,3 +143,99 @@ def test_full_translation_queue_cannot_block_bounded_class_shutdown(tmp_path: Pa
     assert rows[first.id]["original_text"] == "First"
     assert rows[second.id]["original_text"] == "Second"
     assert rows[second.id]["translation_status"] == "retry"
+
+
+def test_budget_paused_sentence_is_saved_without_entering_queue(tmp_path: Path) -> None:
+    class PausedProcessor:
+        budget_guard = staticmethod(lambda phase: False)
+
+    repository = CourseRepository(tmp_path / "budget-queue.db")
+    result = CourseResult("课", "网络", "local:mic", [], "")
+    repository.create_course(result)
+    events: list[tuple[str, object]] = []
+    coordinator = LiveTranslationCoordinator(
+        result, repository, PausedProcessor(), "网络",
+        lambda name, payload: events.append((name, payload)), workers=1,
+    )
+    segment = coordinator.submit("Keep this English", 0, 1000)
+    assert coordinator.queue.empty()
+    row = repository.get_course_segments(result.id)[0]
+    assert row["original_text"] == "Keep this English"
+    assert row["translation_status"] == "retry"
+    assert any(name == "translation_failed" and payload[0] == segment.id for name, payload in events)
+
+
+def test_queue_overflow_marks_each_sentence_but_throttles_warning(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowProcessor:
+        def translate(self, *args):
+            entered.set()
+            release.wait(timeout=3)
+            return "译文"
+
+    repository = CourseRepository(tmp_path / "overflow.db")
+    result = CourseResult("课", "网络", "local:mic", [], "")
+    repository.create_course(result)
+    events: list[tuple[str, object]] = []
+    coordinator = LiveTranslationCoordinator(
+        result, repository, SlowProcessor(), "网络",
+        lambda name, payload: events.append((name, payload)),
+        workers=1, max_queue=1,
+    )
+    coordinator.start()
+    coordinator.submit("First", 0, 1000)
+    assert entered.wait(timeout=1)
+    coordinator.submit("Second", 1000, 2000)
+    overflow_a = coordinator.submit("Third", 2000, 3000)
+    overflow_b = coordinator.submit("Fourth", 3000, 4000)
+    assert [name for name, _ in events].count("warning") == 1
+    failed_ids = {payload[0] for name, payload in events if name == "translation_failed"}
+    assert {overflow_a.id, overflow_b.id} <= failed_ids
+    rows = {row["id"]: row for row in repository.get_course_segments(result.id)}
+    assert rows[overflow_a.id]["translation_status"] == "retry"
+    assert rows[overflow_b.id]["translation_status"] == "retry"
+    release.set()
+    coordinator.close_and_wait(timeout=5)
+
+
+def test_queue_overflow_is_automatically_translated_after_short_pause(tmp_path: Path) -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    deferred_done = threading.Event()
+
+    class SlowFirstProcessor:
+        def translate(self, text: str, *args) -> str:
+            if text == "First":
+                first_started.set()
+                release_first.wait(timeout=3)
+            return f"译文：{text}"
+
+    repository = CourseRepository(tmp_path / "catchup.db")
+    result = CourseResult("课", "网络", "local:mic", [], "")
+    repository.create_course(result)
+    events: list[tuple[str, object]] = []
+
+    def receive(name: str, payload: object) -> None:
+        events.append((name, payload))
+        if name == "segment_update" and payload.original_text == "Third":
+            deferred_done.set()
+
+    coordinator = LiveTranslationCoordinator(
+        result, repository, SlowFirstProcessor(), "网络", receive,
+        workers=1, max_queue=1, catchup_quiet_seconds=0.3,
+    )
+    coordinator.start()
+    coordinator.submit("First", 0, 1000)
+    assert first_started.wait(timeout=1)
+    coordinator.submit("Second", 1000, 2000)
+    deferred = coordinator.submit("Third", 2000, 3000)
+    assert repository.get_course_segments(result.id)[2]["translation_status"] == "retry"
+    release_first.set()
+    assert deferred_done.wait(timeout=3)
+    coordinator.close_and_wait(timeout=5)
+    rows = {row["id"]: row for row in repository.get_course_segments(result.id)}
+    assert rows[deferred.id]["translated_text"] == "译文：Third"
+    assert rows[deferred.id]["translation_status"] == "completed"
+    assert any(name == "segment_retrying" and payload == deferred.id for name, payload in events)

@@ -197,3 +197,16 @@ def test_summary_prompt_labels_new_input_instead_of_repeated_recent_history() ->
     instructions, payload = _live_summary_request("{}", "课", "网络", "New", "新")
     assert "本次新增" in instructions
     assert "本次新增英文字幕：\nNew" in payload
+
+
+def test_budget_pause_keeps_existing_summary_without_new_request() -> None:
+    segment = Segment("New English", "新中文", 0, 1000)
+    result = CourseResult("课", "网络", "mic", [segment], "")
+    processor = SummaryProcessor()
+    processor.budget_guard = lambda phase: False
+    coordinator = LiveSummaryCoordinator(result, processor, "课", "网络", lambda *_: None)
+    coordinator.submit(segment)
+    coordinator._summarize()
+    assert coordinator.queue.empty()
+    assert processor.calls == []
+    assert coordinator._pending_count() == 1

@@ -190,10 +190,10 @@ def friendly_error(error: object) -> str:
     """Turn provider/runtime exceptions into short, actionable Chinese messages."""
     message = str(error).strip()
     lowered = message.lower()
-    if "openai_api_key" in lowered or "api key" in lowered or "api_key" in lowered:
-        return "尚未配置语音服务密钥。请到“设置”中打开配置文件，填写 OPENAI_API_KEY 后重启软件。"
     if "401" in lowered or "unauthorized" in lowered or "invalid api" in lowered:
         return "API 密钥无效或已失效。请检查密钥是否完整，并确认对应账户可以使用当前模型。"
+    if "openai_api_key" in lowered or "api key" in lowered or "api_key" in lowered:
+        return "尚未配置所需 API Key。请在“设置”中填写并保存；云端语音需要 OPENAI_API_KEY。"
     if "429" in lowered or "rate limit" in lowered:
         return "服务请求过于频繁或账户额度不足。课堂内容不会因此被删除，请稍后重试或检查账户余额。"
     if "timeout" in lowered or "timed out" in lowered:
@@ -225,6 +225,17 @@ def show_message(parent: QWidget, icon: QMessageBox.Icon, title: str, text: str)
     box.setStandardButtons(QMessageBox.StandardButton.Ok)
     box.button(QMessageBox.StandardButton.Ok).setText("知道了")
     box.exec()
+
+
+def ask_open_course(parent: QWidget, title: str, text: str) -> bool:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle(title)
+    box.setText(text)
+    open_button = box.addButton("打开课程库", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("稍后处理", QMessageBox.ButtonRole.RejectRole)
+    box.exec()
+    return box.clickedButton() is open_button
 
 
 def confirm_message(parent: QWidget, title: str, text: str) -> bool:
@@ -1214,6 +1225,7 @@ class SummaryPane(QFrame):
 
 
 class LivePage(Page):
+    course_open_requested = Signal(str)
     VISIBLE_PARAGRAPHS = 160
     PAGE_PARAGRAPHS = 100
 
@@ -1993,18 +2005,24 @@ class LivePage(Page):
     def update_translation_quality(self, metrics: object) -> None:
         values = metrics  # type: ignore[assignment]
         queued = int(values.get("translation_queue", 0))  # type: ignore[attr-defined]
+        deferred = int(values.get("translation_deferred", 0))  # type: ignore[attr-defined]
+        fresh = max(0, queued - deferred)
         active = int(values.get("translation_active", 0))  # type: ignore[attr-defined]
         duration = int(values.get("last_translation_ms", 0))  # type: ignore[attr-defined]
-        if queued >= 8:
-            text, color = f"翻译 积压 {queued} 句", COLORS["danger"]
-        elif queued >= 3:
-            text, color = f"翻译 排队 {queued} 句", "#9A6700"
-        elif queued or active:
-            text, color = f"翻译 处理中{f' · {queued}句待处理' if queued else ''}", COLORS["muted"]
+        if fresh >= 8:
+            text, color = f"翻译 积压 {fresh} 句", COLORS["danger"]
+        elif fresh >= 3:
+            text, color = f"翻译 排队 {fresh} 句", "#9A6700"
+        elif fresh or active:
+            text, color = f"翻译 处理中{f' · {fresh}句排队' if fresh else ''}", COLORS["muted"]
+        elif deferred:
+            text, color = f"翻译 等空档补 {deferred} 句", "#9A6700"
         elif duration:
             text, color = f"翻译 实时 · {duration}ms", COLORS["muted"]
         else:
             text, color = "翻译 等待英文", COLORS["muted"]
+        if deferred and (fresh or active):
+            text += f" · 待补{deferred}"
         self._set_quality_text(self.translation_quality, text, color)
 
     def start(self) -> None:
@@ -2221,7 +2239,7 @@ class LivePage(Page):
         elif name == "segment":
             self.add_segment(payload)  # type: ignore[arg-type]
         elif name == "translation_failed":
-            segment_id, _ = payload  # type: ignore[misc]
+            segment_id, reason = payload  # type: ignore[misc]
             self.failed_segment_ids.add(str(segment_id))
             saved = self.segments_by_id.get(str(segment_id))
             if saved is not None:
@@ -2231,6 +2249,10 @@ class LivePage(Page):
                 card.update_translation(str(segment_id), "", failed=True)
             if str(segment_id) == self.latest_segment_id:
                 self.current_translation.setText(
+                    "预算已用完 · 英文继续保存，中文可课后补译"
+                    if "预算" in str(reason) else
+                    "翻译积压 · 英文已保存，空档自动补译"
+                    if "队列" in str(reason) else
                     "本句翻译暂时失败 · 英文已保存，可稍后在课程库补译"
                 )
         elif name == "segment_retrying":
@@ -2262,8 +2284,24 @@ class LivePage(Page):
         elif name == "finished":
             result, path = payload  # type: ignore[misc]
             self.status.setText(f"课堂笔记已导出：{path}")
+            row = self.repository.get_course(result.id)
+            needs_attention = row is not None and str(row["status"]) == "needs_attention"
+            pending_count = len(self.repository.pending_segments(result.id)) if needs_attention else 0
             self.reset()
-            show_message(self, QMessageBox.Icon.Information, "课堂已整理", f"《{result.title}》已完成。\n\n笔记位置：{path}")
+            if needs_attention:
+                detail = str(row["error_message"] or "部分内容需要课后处理。")
+                message = (
+                    f"《{result.title}》的英文记录和已有译文已保存并导出。\n\n"
+                    f"{detail}\n\n"
+                    f"待补译：{pending_count} 句\n笔记位置：{path}"
+                )
+                if ask_open_course(self, "课堂记录已保存 · 待处理", message):
+                    self.course_open_requested.emit(result.id)
+            else:
+                show_message(
+                    self, QMessageBox.Icon.Information, "课堂已整理",
+                    f"《{result.title}》已完成。\n\n笔记位置：{path}",
+                )
         elif name == "error":
             self.notice.show_notice(friendly_error(payload), "检查设置", error=True)
             self.reset()
@@ -3072,17 +3110,40 @@ class SettingsPage(Page):
         text_layout.setSpacing(11)
         text_title = QLabel("翻译与笔记")
         text_title.setObjectName("SectionTitle")
-        text_hint = QLabel("OpenAI 可以复用语音密钥；DeepSeek 使用独立密钥。")
+        text_hint = QLabel("OpenAI 文本 Key 可单独填写，或留空复用已保存的 OpenAI 语音 Key；各服务的密钥互不混用。")
         text_hint.setObjectName("Muted")
+        text_hint.setWordWrap(True)
         text_fields = QHBoxLayout()
         self.provider = QComboBox()
         self.provider.addItems(self.PROVIDERS.keys())
         current_label = next((label for label, value in self.PROVIDERS.items() if value == settings.text_provider), "OpenAI")
         self.provider.setCurrentText(current_label)
+        active_provider = self.PROVIDERS[current_label]
+        self._provider_keys = {
+            "openai": os.getenv("OPENAI_TEXT_API_KEY", ""),
+            "deepseek": os.getenv("DEEPSEEK_API_KEY", ""),
+            "compatible": os.getenv("COMPATIBLE_API_KEY", ""),
+        }
+        if active_provider == "openai":
+            if settings.text_api_key and settings.text_api_key != settings.api_key:
+                self._provider_keys["openai"] = settings.text_api_key
+        elif settings.text_api_key:
+            self._provider_keys[active_provider] = settings.text_api_key
+        self._active_text_provider: str | None = None
+        self._provider_models = {
+            name: (
+                settings.text_model if name == active_provider
+                else os.getenv(f"{name.upper()}_TEXT_MODEL", "") or models[0]
+            )
+            for name, models in self.MODELS.items()
+        }
         self.text_model = QComboBox()
         self.text_model.setEditable(True)
-        self.text_key = self._key_input(settings.text_api_key if settings.text_provider != "openai" else None, "粘贴文本服务 API Key（sk-...）")
-        self.base_url = QLineEdit(settings.text_base_url or "")
+        self.text_key = self._key_input(self._provider_keys[active_provider], "粘贴文本服务 API Key（sk-...）")
+        self.base_url = QLineEdit(
+            os.getenv("COMPATIBLE_BASE_URL", "")
+            or (settings.text_base_url or "" if active_provider == "compatible" else "")
+        )
         self.base_url.setPlaceholderText("兼容服务地址，例如 http://localhost:11434/v1")
         text_fields.addWidget(self.provider, 1)
         text_fields.addWidget(self.text_model, 1)
@@ -3177,13 +3238,18 @@ class SettingsPage(Page):
 
     def provider_changed(self, label: str, preserve_model: str = "") -> None:
         provider = self.PROVIDERS[label]
+        if self._active_text_provider is not None:
+            self._provider_keys[self._active_text_provider] = self.text_key.text().strip()
+            self._provider_models[self._active_text_provider] = self.text_model.currentText().strip()
+        self._active_text_provider = provider
+        self.text_key.setText(self._provider_keys[provider])
         self.text_model.clear()
         self.text_model.addItems(self.MODELS[provider])
-        if preserve_model:
-            self.text_model.setCurrentText(preserve_model)
-        self.text_key.setVisible(provider != "openai")
+        self.text_model.setCurrentText(preserve_model or self._provider_models[provider])
         self.base_url.setVisible(provider == "compatible")
-        if provider == "deepseek":
+        if provider == "openai":
+            self.text_key.setPlaceholderText("粘贴 OpenAI 文本 Key；留空复用语音 Key")
+        elif provider == "deepseek":
             self.text_key.setPlaceholderText("粘贴 DeepSeek API Key（sk-...）")
         elif provider == "compatible":
             self.text_key.setPlaceholderText("粘贴兼容服务 API Key；本地服务可填写 local")
@@ -3294,6 +3360,10 @@ class SettingsPage(Page):
             self.notice.show_notice(f"云端语音转写需要 OpenAI API Key；也可以选择{local_speech_name()}识别。", error=True)
             self.speech_key.setFocus()
             return
+        if provider == "openai" and not text_key and not speech_key:
+            self.notice.show_notice("OpenAI 翻译需要 API Key；可在此填写，或填写上方云端语音 Key 供两者共用。", error=True)
+            self.text_key.setFocus()
+            return
         if provider != "openai" and not text_key:
             self.notice.show_notice("请填写所选文本服务的 API Key。", error=True)
             self.text_key.setFocus()
@@ -3321,6 +3391,8 @@ class SettingsPage(Page):
             self.notice.show_notice(friendly_error(exc), error=True)
             self.output_dir.setFocus()
             return
+        self._provider_keys[provider] = text_key
+        self._provider_models[provider] = model
         values = {
             "OPENAI_API_KEY": speech_key,
             "LIVE_MODE": "local" if local_speech else "realtime",
@@ -3337,8 +3409,13 @@ class SettingsPage(Page):
             "LOCAL_REFRESH_MS": "800",
             "TEXT_PROVIDER": provider,
             "TEXT_MODEL": model,
-            "TEXT_API_KEY": text_key if provider == "compatible" else "",
-            "DEEPSEEK_API_KEY": text_key if provider == "deepseek" else "",
+            "OPENAI_TEXT_MODEL": self._provider_models["openai"],
+            "DEEPSEEK_TEXT_MODEL": self._provider_models["deepseek"],
+            "COMPATIBLE_TEXT_MODEL": self._provider_models["compatible"],
+            "OPENAI_TEXT_API_KEY": self._provider_keys["openai"],
+            "DEEPSEEK_API_KEY": self._provider_keys["deepseek"],
+            "COMPATIBLE_API_KEY": self._provider_keys["compatible"],
+            "COMPATIBLE_BASE_URL": self.base_url.text().strip(),
             "TEXT_BASE_URL": base_url if provider == "compatible" else ("https://api.deepseek.com" if provider == "deepseek" else ""),
             "CLASSNOTE_EXPORT_DIR": str(output_dir),
             "CLASSNOTE_TEMP_AUDIO": "true" if self.temporary_audio_check.isChecked() else "false",
@@ -3433,6 +3510,7 @@ class MainWindow(QMainWindow):
             self.toggle_fullscreen,
             self.repository,
         )
+        self.live_page.course_open_requested.connect(self.open_course)
         self.file_page = FilePage(self.bridge, self.repository)
         self.library_page = LibraryPage(self.repository)
         self.settings_page = SettingsPage(self.settings)

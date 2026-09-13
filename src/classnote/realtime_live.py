@@ -93,7 +93,6 @@ class RealtimeLiveCourseSession:
             self.settings.text_model,
             self.settings.text_api_key,
             self.settings.text_base_url,
-            self.client if self.settings.text_provider == "openai" else None,
         )
         bind_course_usage(
             self.text_processor, self.repository, self.result.id,

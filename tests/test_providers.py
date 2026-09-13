@@ -42,10 +42,23 @@ def test_compatible_provider_requires_base_url() -> None:
         create_text_processor("compatible", "model", "key", None)
 
 
+def test_openai_text_processor_uses_its_selected_key(monkeypatch) -> None:
+    created: list[dict[str, object]] = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr("classnote.services.OpenAI", FakeOpenAI)
+    create_text_processor("openai", "gpt-5-mini", "text-only-key", None)
+    assert created == [{"api_key": "text-only-key", "base_url": None}]
+
+
 def test_deepseek_settings_use_current_default_model(monkeypatch) -> None:
     monkeypatch.setenv("TEXT_PROVIDER", "deepseek")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.delenv("TEXT_MODEL", raising=False)
+    monkeypatch.delenv("DEEPSEEK_TEXT_MODEL", raising=False)
     monkeypatch.delenv("TEXT_BASE_URL", raising=False)
     settings = Settings.load()
     assert settings.text_provider == "deepseek"

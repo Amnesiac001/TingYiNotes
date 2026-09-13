@@ -115,8 +115,7 @@ class LiveSummaryCoordinator:
     def submit(self, segment: Segment) -> None:
         if self._closed or not segment.translated_text.strip():
             return
-        guard = getattr(self.text_processor, "budget_guard", None)
-        if callable(guard) and not guard("summary"):
+        if self._budget_paused():
             return
         try:
             self.queue.put_nowait(segment)
@@ -155,6 +154,9 @@ class LiveSummaryCoordinator:
                 continue
             if item is None or self._closed:
                 return
+            if self._budget_paused():
+                completed = 0
+                continue
             completed += 1
             self.event(
                 "summary_status",
@@ -189,8 +191,7 @@ class LiveSummaryCoordinator:
         )
 
     def _summarize(self) -> None:
-        guard = getattr(self.text_processor, "budget_guard", None)
-        if callable(guard) and not guard("summary"):
+        if self._budget_paused():
             return
         method = getattr(self.text_processor, "summarize_live", None)
         if not callable(method):
@@ -239,10 +240,14 @@ class LiveSummaryCoordinator:
             )
             self._warning_shown = False
             self.event("summary_update", self._snapshot)
-            self.event("summary_status", {"state": "updated"})
+            self.event("summary_status", {"state": "paused_budget" if self._budget_paused() else "updated"})
         except Exception as exc:
             if not self._closed and not self._warning_shown:
                 self._warning_shown = True
                 self.event("warning", f"滚动摘要暂时未更新，不影响字幕和翻译：{exc}")
             if not self._closed:
-                self.event("summary_status", {"state": "waiting"})
+                self.event("summary_status", {"state": "paused_budget" if self._budget_paused() else "waiting"})
+
+    def _budget_paused(self) -> bool:
+        guard = getattr(self.text_processor, "budget_guard", None)
+        return callable(guard) and not guard("summary")

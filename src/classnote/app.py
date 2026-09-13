@@ -62,7 +62,6 @@ def process_course(
                 settings.text_model,
                 settings.text_api_key,
                 settings.text_base_url,
-                client if settings.text_provider == "openai" else None,
             ),
             progress,
             usage_provider=settings.text_provider,

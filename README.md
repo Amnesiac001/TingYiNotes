@@ -173,6 +173,8 @@ LIVE_CHUNK_SECONDS=10
 
 短暂停顿属于正常情况，不会立刻报警。状态栏只用于运行监测，不会改变或删除已经保存的英文字幕。
 
+如果快速讲课导致翻译队列暂时装满，新句子的英文会先写入课程库并标为待补译；课堂短暂停顿且实时队列空下来后，软件只用一个后台工作线程自动补回，优先处理新字幕。若下课时仍有待补译句子，结束提示会给出数量和课程库入口，不会误报“全部完成”。
+
 选择 `.mp3`、`.wav`、`.m4a`、`.mp4`、`.mpeg`、`.mpga`、`.ogg`、`.webm` 或 `.flac` 文件，填写课程名称，然后开始处理。
 文件处理会先创建可恢复的课程任务，Whisper 每产生一条英文就立即保存，再用两个并发翻译任务保持每条英文与中文一一对应。翻译或整理失败时，已经完成的英文不会丢失，可从课程库继续处理。
 
@@ -200,12 +202,14 @@ classnote process lesson.mp3 --title "操作系统" --term "thread=线程" --ter
 LIVE_MODE=local
 TEXT_PROVIDER=deepseek
 DEEPSEEK_API_KEY=你的DeepSeek密钥
-TEXT_MODEL=deepseek-v4-flash
+DEEPSEEK_TEXT_MODEL=deepseek-v4-flash
 ```
 
-`deepseek-v4-flash` 适合逐句翻译和普通笔记整理。程序会关闭思考模式以减少实时字幕等待时间。如果希望课后整理使用更强模型，目前也可以将 `TEXT_MODEL` 改为 `deepseek-v4-pro`，但这会同时影响逐句翻译的延迟和费用。
+`deepseek-v4-flash` 适合逐句翻译和普通笔记整理。程序会关闭思考模式以减少实时字幕等待时间。如果希望课后整理使用更强模型，目前也可以将 `DEEPSEEK_TEXT_MODEL` 改为 `deepseek-v4-pro`，但这会同时影响逐句翻译的延迟和费用。
 
 DeepSeek 当前提供文本模型，不负责麦克风语音识别；本软件通过本地 RTX 运行 faster-whisper 补齐这部分，因此默认方案只需要一个 DeepSeek Key。
+
+在设置页切换 OpenAI、DeepSeek 和自定义兼容服务时，密钥和模型名分别记住各自的值，不会把上一家服务的配置带过去；兼容服务的地址也会单独保存。OpenAI 文本翻译可以填写独立的 `OPENAI_TEXT_API_KEY`；留空时复用 `OPENAI_API_KEY`。使用本地语音时，文本 Key 输入框仍会显示。旧版 `TEXT_API_KEY`、`TEXT_BASE_URL` 和 `TEXT_MODEL` 配置仍可读取，界面保存后使用各服务独立的配置项。
 
 ### 查看文本 API 用量
 
@@ -227,18 +231,18 @@ Token 数只来自服务端返回的 `usage`，不会用字符数冒充。若服
 
 ```dotenv
 TEXT_PROVIDER=compatible
-TEXT_API_KEY=服务密钥
-TEXT_BASE_URL=https://服务地址/v1
-TEXT_MODEL=模型名称
+COMPATIBLE_API_KEY=服务密钥
+COMPATIBLE_BASE_URL=https://服务地址/v1
+COMPATIBLE_TEXT_MODEL=模型名称
 ```
 
 本地兼容服务也可以这样配置，例如：
 
 ```dotenv
 TEXT_PROVIDER=compatible
-TEXT_API_KEY=local
-TEXT_BASE_URL=http://localhost:11434/v1
-TEXT_MODEL=qwen3:8b
+COMPATIBLE_API_KEY=local
+COMPATIBLE_BASE_URL=http://localhost:11434/v1
+COMPATIBLE_TEXT_MODEL=qwen3:8b
 ```
 
 兼容模式要求服务实现 OpenAI 风格的 `/chat/completions`。不同服务对 `base_url` 是否包含 `/v1` 的要求不同，应以对应服务文档为准。

@@ -4,6 +4,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -44,6 +45,7 @@ class LiveTranslationCoordinator:
         workers: int = 2,
         max_queue: int = 64,
         on_translated: Callable[[Segment], None] | None = None,
+        catchup_quiet_seconds: float = 2.0,
     ) -> None:
         self.result = result
         self.repository = repository
@@ -61,7 +63,13 @@ class LiveTranslationCoordinator:
         self._last_translation_ms = 0
         self._last_queue_wait_ms = 0
         self.on_translated = on_translated
+        self.catchup_quiet_seconds = max(0.0, catchup_quiet_seconds)
         self._retrying_ids: set[str] = set()
+        self._last_overflow_notice = 0.0
+        self._deferred: deque[TranslationJob] = deque()
+        self._deferred_ids: set[str] = set()
+        self._catchup_active = False
+        self._last_submit_at = time.monotonic()
 
     def start(self) -> None:
         for index in range(self.workers):
@@ -82,27 +90,41 @@ class LiveTranslationCoordinator:
             order = self._order
             self._order += 1
             self.result.segments.append(segment)
+            self._last_submit_at = time.monotonic()
         # The English transcript is durable before any network request starts.
         self.repository.add_segment(self.result.id, segment, order, "pending")
         self.event("segment_original", segment)
         job = TranslationJob(segment=segment, queued_at=time.monotonic())
         if self._closed:
+            message = "课堂正在结束，英文已保存，可在课程库中补译。"
             self.repository.set_translation_state(
-                segment.id,
-                "retry",
-                error="课堂正在结束，英文已保存，可在课程库中补译。",
+                segment.id, "retry", error=message,
             )
+            self.event("translation_failed", (segment.id, message))
+            self._emit_metrics()
+            return segment
+        guard = getattr(self.text_processor, "budget_guard", None)
+        if callable(guard) and not guard("translation"):
+            message = "本节课文本预算已用完，英文已保存，可在课程库中补译。"
+            self.repository.set_translation_state(segment.id, "retry", error=message)
+            self.event("translation_failed", (segment.id, message))
             self._emit_metrics()
             return segment
         try:
             self.queue.put_nowait(job)
         except queue.Full:
+            message = "翻译队列已满，英文已保存；课堂短暂停顿后会尝试自动补译。"
             self.repository.set_translation_state(
-                segment.id,
-                "retry",
-                error="翻译队列已满，英文已保存，等待稍后补译。",
+                segment.id, "retry", error=message,
             )
-            self.event("warning", "中文翻译暂时积压；英文已安全保存，稍后可以自动补译。")
+            with self._lock:
+                self._deferred.append(job)
+                self._deferred_ids.add(segment.id)
+            self.event("translation_failed", (segment.id, message))
+            now = time.monotonic()
+            if now - self._last_overflow_notice >= 15:
+                self._last_overflow_notice = now
+                self.event("warning", "中文翻译队列已满；英文已保存，课堂短暂停顿后会自动补译，也可课后从课程库继续。")
         self._emit_metrics()
         return segment
 
@@ -150,9 +172,14 @@ class LiveTranslationCoordinator:
     def retry(self, segment_id: str) -> Segment:
         if self._closed:
             raise RuntimeError("课堂正在结束，失败译文可以稍后在课程库中补译。")
+        guard = getattr(self.text_processor, "budget_guard", None)
+        if callable(guard) and not guard("translation"):
+            raise BudgetLimitReached()
         with self._lock:
             if segment_id in self._retrying_ids:
                 raise RuntimeError("这句内容已经在重新翻译。")
+            if segment_id in self._deferred_ids:
+                raise RuntimeError("这句已在等待课堂空闲时自动补译，英文已保存。")
             segment = next(
                 (item for item in self.result.segments if item.id == segment_id), None
             )
@@ -179,12 +206,17 @@ class LiveTranslationCoordinator:
 
     def _worker(self) -> None:
         while True:
+            from_deferred = False
             try:
                 job = self.queue.get(timeout=0.2)
             except queue.Empty:
                 if self._closed:
                     return
-                continue
+                job = self._take_deferred()
+                if job is None:
+                    continue
+                from_deferred = True
+                self.event("segment_retrying", job.segment.id)
             if job is None:
                 self.queue.task_done()
                 return
@@ -199,8 +231,34 @@ class LiveTranslationCoordinator:
                 with self._lock:
                     self._active_jobs = max(0, self._active_jobs - 1)
                     self._last_translation_ms = int((time.monotonic() - started) * 1000)
-                self.queue.task_done()
+                if from_deferred:
+                    with self._lock:
+                        self._catchup_active = False
+                else:
+                    self.queue.task_done()
                 self._emit_metrics()
+
+    def _take_deferred(self) -> TranslationJob | None:
+        guard = getattr(self.text_processor, "budget_guard", None)
+        if callable(guard) and not guard("translation"):
+            return None
+        with self._lock:
+            if (
+                self._closed or self._catchup_active or not self._deferred
+                or not self.queue.empty()
+                or (self.workers > 1 and self._active_jobs >= self.workers - 1)
+                or time.monotonic() - self._last_submit_at < self.catchup_quiet_seconds
+            ):
+                return None
+            while self._deferred:
+                job = self._deferred.popleft()
+                self._deferred_ids.discard(job.segment.id)
+                if job.segment.translated_text or job.segment.id in self._retrying_ids:
+                    continue
+                self._retrying_ids.add(job.segment.id)
+                self._catchup_active = True
+                return job
+        return None
 
     def _translate(self, job: TranslationJob) -> None:
         segment = job.segment
@@ -273,10 +331,12 @@ class LiveTranslationCoordinator:
             active_jobs = self._active_jobs
             last_translation_ms = self._last_translation_ms
             last_queue_wait_ms = self._last_queue_wait_ms
+            deferred = len(self._deferred)
         self.event(
             "metrics",
             {
-                "translation_queue": self.queue.qsize(),
+                "translation_queue": self.queue.qsize() + deferred,
+                "translation_deferred": deferred,
                 "translation_workers": self.workers,
                 "translation_active": active_jobs,
                 "last_translation_ms": last_translation_ms,

@@ -53,3 +53,36 @@ def test_class_budget_configuration_is_optional_and_validated(monkeypatch) -> No
     assert str(Settings.load().class_budget_usd) == "0.10"
     monkeypatch.setenv("CLASSNOTE_CLASS_BUDGET_USD", "invalid")
     assert Settings.load().class_budget_usd is None
+
+
+def test_provider_specific_keys_do_not_cross_or_override_explicit_empty(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "speech-key")
+    monkeypatch.setenv("TEXT_API_KEY", "legacy-key")
+    monkeypatch.delenv("OPENAI_TEXT_API_KEY", raising=False)
+    monkeypatch.setenv("TEXT_PROVIDER", "openai")
+    assert Settings.load().text_api_key == "legacy-key"
+    monkeypatch.setenv("OPENAI_TEXT_API_KEY", "")
+    assert Settings.load().text_api_key == "speech-key"
+    monkeypatch.setenv("OPENAI_TEXT_API_KEY", "text-key")
+    assert Settings.load().text_api_key == "text-key"
+
+    monkeypatch.setenv("TEXT_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("DEEPSEEK_TEXT_MODEL", "chosen-deepseek")
+    assert Settings.load().text_api_key == "deepseek-key"
+    assert Settings.load().text_model == "chosen-deepseek"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    assert Settings.load().text_api_key is None
+
+    monkeypatch.setenv("TEXT_PROVIDER", "compatible")
+    monkeypatch.setenv("COMPATIBLE_API_KEY", "compatible-key")
+    monkeypatch.setenv("COMPATIBLE_TEXT_MODEL", "chosen-compatible")
+    monkeypatch.setenv("COMPATIBLE_BASE_URL", "https://compatible.example/v1")
+    assert Settings.load().text_api_key == "compatible-key"
+    assert Settings.load().text_model == "chosen-compatible"
+    assert Settings.load().text_base_url == "https://compatible.example/v1"
+    monkeypatch.setenv("COMPATIBLE_API_KEY", "")
+    assert Settings.load().text_api_key is None
+    monkeypatch.setenv("COMPATIBLE_BASE_URL", "")
+    monkeypatch.setenv("TEXT_BASE_URL", "https://old.example/v1")
+    assert Settings.load().text_base_url is None

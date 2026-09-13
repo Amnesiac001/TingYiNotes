@@ -371,17 +371,16 @@ def create_text_processor(
     model: str,
     api_key: str | None,
     base_url: str | None,
-    openai_client: OpenAI | None = None,
 ) -> TextProcessor:
     if provider == "openai":
         if not api_key:
-            raise RuntimeError("文本服务缺少 API 密钥。请配置 OPENAI_API_KEY 或 TEXT_API_KEY。")
-        client = openai_client or OpenAI(api_key=api_key, base_url=base_url)
+            raise RuntimeError("OpenAI 文本服务缺少 API 密钥。请在设置中填写文本 Key，或复用 OPENAI_API_KEY。")
+        client = OpenAI(api_key=api_key, base_url=base_url)
         return OpenAITextProcessor(client, model)
     if provider not in {"deepseek", "compatible"}:
         raise ValueError("TEXT_PROVIDER 只能是 openai、deepseek 或 compatible。")
     if not api_key:
-        variable = "DEEPSEEK_API_KEY" if provider == "deepseek" else "TEXT_API_KEY"
+        variable = "DEEPSEEK_API_KEY" if provider == "deepseek" else "COMPATIBLE_API_KEY"
         raise RuntimeError(f"文本服务缺少 API 密钥。请配置 {variable}。")
     if not base_url:
         raise RuntimeError("兼容文本服务需要配置 TEXT_BASE_URL。")
