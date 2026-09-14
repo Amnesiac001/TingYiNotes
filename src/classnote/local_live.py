@@ -472,6 +472,7 @@ class LocalLiveCourseSession:
                     finish_temporary_audio(
                         getattr(self, "temporary_audio", None), self.repository, self.result.id,
                         lambda message: self.event("warning", message),
+                        retain_completed=getattr(self.settings, "retain_audio_for_review", False),
                     )
                 finally:
                     if startup_error is not None:

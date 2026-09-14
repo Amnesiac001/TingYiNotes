@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import classnote.config as config
 import classnote.local_live as local_live
+from classnote.app import process_course
 from classnote.models import Segment
 from classnote.services import CoursePipeline, LocalWhisperTranscriber
 from classnote.storage import CourseRepository
@@ -66,6 +67,40 @@ def test_pipeline_builds_complete_result(tmp_path: Path) -> None:
     assert result.translated_text == "一句课堂内容。"
     assert result.notes_markdown.startswith("# 第一课")
     assert len(messages) == 4
+
+
+def test_offline_demo_needs_no_source_file_and_exports_notes(monkeypatch, tmp_path: Path) -> None:
+    database = tmp_path / "data" / "classnote.db"
+    exports = tmp_path / "notes"
+    monkeypatch.setenv("CLASSNOTE_DB", str(database))
+    monkeypatch.setenv("CLASSNOTE_EXPORT_DIR", str(exports))
+    missing_source = tmp_path / "offline-demo"
+    assert not missing_source.exists()
+
+    result, exported = process_course(
+        missing_source, "离线演示课", "计算机网络", demo=True,
+    )
+
+    assert exported.is_file()
+    assert "TCP" in exported.read_text(encoding="utf-8")
+    assert result.source_path == ""
+    assert len(result.segments) == 2
+    assert result.segments[0].translated_text.startswith("今天我们将讨论")
+    assert result.segments[1].translated_text.startswith("在慢启动阶段")
+    assert result.segments[0].translated_text != result.segments[1].translated_text
+    assert exported.read_text(encoding="utf-8").count("今天我们将讨论") == 1
+    saved = CourseRepository(database).get_course(result.id)
+    assert saved is not None
+    assert saved["source_path"] == ""
+    assert saved["status"] == "completed"
+
+
+def test_real_file_processing_still_rejects_missing_source(tmp_path: Path) -> None:
+    import pytest
+
+    pipeline = CoursePipeline(FakeTranscriber(), FakeTextProcessor())
+    with pytest.raises(FileNotFoundError, match="找不到文件"):
+        pipeline.run(tmp_path / "missing.wav", "课堂", "通用课程")
 
 
 class MultiSegmentTranscriber:

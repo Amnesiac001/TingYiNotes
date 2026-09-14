@@ -112,13 +112,13 @@ def start_temporary_audio(
 
 def finish_temporary_audio(
     recorder: TemporaryAudioRecorder | None, repository: CourseRepository,
-    course_id: str, warning: Callable[[str], None],
+    course_id: str, warning: Callable[[str], None], *, retain_completed: bool = False,
 ) -> None:
     if recorder is None:
         return
     try:
         row = repository.get_course(course_id)
-        delete = row is None or str(row["status"]) == "completed"
+        delete = row is None or (str(row["status"]) == "completed" and not retain_completed)
     except Exception as exc:
         delete = False
         warning(f"无法确认课堂是否已完成，临时音频将保留：{exc}")

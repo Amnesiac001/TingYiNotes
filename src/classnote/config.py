@@ -110,6 +110,7 @@ class Settings:
     text_base_url: str | None
     temporary_audio: bool
     class_budget_usd: Decimal | None = None
+    retain_audio_for_review: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -145,8 +146,8 @@ class Settings:
             api_key=openai_key,
             transcription_model=os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe"),
             text_model=os.getenv(model_key) or os.getenv("TEXT_MODEL") or default_text_model,
-            database_path=_data_path(os.getenv("CLASSNOTE_DB", "data/classnote.db"), env_path.parent),
-            export_dir=_data_path(os.getenv("CLASSNOTE_EXPORT_DIR", "exports"), env_path.parent),
+            database_path=_data_path(os.getenv("CLASSNOTE_DB") or "data/classnote.db", env_path.parent),
+            export_dir=_data_path(os.getenv("CLASSNOTE_EXPORT_DIR") or "exports", env_path.parent),
             live_chunk_seconds=max(5, int(os.getenv("LIVE_CHUNK_SECONDS", "10"))),
             live_mode=os.getenv("LIVE_MODE", "local").strip().lower(),
             live_transcription_model=os.getenv(
@@ -167,6 +168,8 @@ class Settings:
             temporary_audio=os.getenv("CLASSNOTE_TEMP_AUDIO", "false").strip().lower()
             in {"1", "true", "yes", "on"},
             class_budget_usd=budget if budget > 0 else None,
+            retain_audio_for_review=os.getenv("CLASSNOTE_RETAIN_REVIEW_AUDIO", "false").strip().lower()
+            in {"1", "true", "yes", "on"},
         )
 
     def ensure_directories(self) -> None:

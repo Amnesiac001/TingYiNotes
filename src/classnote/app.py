@@ -39,7 +39,10 @@ def process_course(
         raise ValueError(f"不支持的文件格式：{audio_path.suffix or '无扩展名'}")
 
     if demo:
-        pipeline = CoursePipeline(DemoTranscriber(), DemoTextProcessor(), progress)
+        pipeline = CoursePipeline(
+            DemoTranscriber(), DemoTextProcessor(), progress,
+            source_file_required=False,
+        )
     else:
         client = OpenAI(api_key=settings.api_key) if settings.api_key else None
         if settings.live_mode == "local":

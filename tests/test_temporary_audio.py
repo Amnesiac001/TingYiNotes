@@ -73,6 +73,22 @@ def test_failed_class_keeps_audio_for_recovery(tmp_path: Path) -> None:
     assert any("保留" in message for message in warnings)
 
 
+def test_completed_class_keeps_audio_only_when_review_is_opted_in(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "classnote.db")
+    course = CourseResult("课", "网络", "mic", [], "")
+    repository.create_course(course)
+    warnings: list[str] = []
+    recorder = start_temporary_audio(repository.database_path, course.id, 16000, warnings.append)
+    assert recorder is not None
+    recorder.submit(b"\x00\x00" * 16000)
+    repository.finalize_course(course.id, "# 课", str(tmp_path / "notes.md"))
+    finish_temporary_audio(
+        recorder, repository, course.id, warnings.append, retain_completed=True,
+    )
+    assert recorder.path.is_file()
+    assert any("保留" in message for message in warnings)
+
+
 def test_audio_backup_only_accepts_a_course_uuid(tmp_path: Path) -> None:
     try:
         TemporaryAudioRecorder(tmp_path / "db.sqlite", "../outside", 16000, lambda _: None)

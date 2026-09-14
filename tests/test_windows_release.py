@@ -66,3 +66,17 @@ def test_bundled_self_check_prepares_cuda_and_probes_storage(monkeypatch, tmp_pa
     report = launcher.run_self_check()
     assert report["model_inference_ready"] is True
     assert order[-2:] == ["model", "inference"]
+
+
+def test_bundled_release_smoke_exports_offline_demo(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("CLASSNOTE_DB", str(tmp_path / "data" / "classnote.db"))
+    monkeypatch.setenv("CLASSNOTE_EXPORT_DIR", str(tmp_path / "exports"))
+
+    report = launcher.run_release_smoke()
+
+    assert report == {
+        "demo_course_saved": True,
+        "demo_export_ready": True,
+        "demo_segments": 2,
+    }
+    assert len(list((tmp_path / "exports").glob("*.md"))) == 1

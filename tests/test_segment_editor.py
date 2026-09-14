@@ -1,10 +1,11 @@
 import os
+import wave
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from classnote.config import Settings
 from classnote.models import CourseResult, Segment
@@ -122,4 +123,60 @@ def test_library_enables_post_class_edit_and_refreshes_corrected_preview(
     assert page.recover_button.isEnabled()
     assert page.recover_button.text() == "重新整理"
     page.close()
+    app.processEvents()
+
+
+def test_review_filter_and_local_replay_button_visibility(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "review.db")
+    segment = Segment("one two three four five", "", 1000, 1100)
+    course = CourseResult("课堂", "网络", "mic", [segment], "")
+    repository.save(course)
+    parent = QWidget()
+    editor = SegmentEditorDialog(repository, course.id, course.title, parent)
+    assert "建议核对" in editor.list.item(0).text()
+    assert "中文待补译" in editor.review_hint.text()
+    assert not editor.play_button.isEnabled()
+    editor.review_only.setChecked(True)
+    assert not editor.list.item(0).isHidden()
+    editor.search.setText("something else")
+    assert editor.list.item(0).isHidden()
+    editor.close()
+    parent.close()
+    app.processEvents()
+
+
+def test_review_audio_can_be_deleted_without_deleting_course(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "review-delete.db")
+    segment = Segment("Hello.", "你好。", 0, 1000)
+    course = CourseResult("课堂", "网络", "mic", [segment], "# 笔记")
+    repository.save(course)
+    audio_path = tmp_path / "temporary-audio" / f"{course.id}.wav"
+    audio_path.parent.mkdir()
+    with wave.open(str(audio_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    parent = QWidget()
+    editor = SegmentEditorDialog(repository, course.id, course.title, parent)
+    assert editor.play_button.isEnabled()
+    assert editor.delete_audio_button.isEnabled()
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.No,
+    )
+    editor.delete_audio()
+    assert audio_path.is_file()
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    editor.delete_audio()
+    assert not audio_path.exists()
+    assert repository.get_course(course.id) is not None
+    assert not editor.play_button.isEnabled()
+    editor.close()
+    parent.close()
     app.processEvents()

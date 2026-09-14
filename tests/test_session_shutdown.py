@@ -19,10 +19,11 @@ def test_chunked_session_reports_end_only_after_audio_cleanup(monkeypatch) -> No
     session.temporary_audio = object()
     session.repository = object()
     session.result = SimpleNamespace(id="chunked-course")
+    session.settings = SimpleNamespace(retain_audio_for_review=False)
     session.event = lambda name, payload: order.append(name)
     monkeypatch.setattr(
         chunked_live, "finish_temporary_audio",
-        lambda *args: order.append("audio-closed"),
+        lambda *args, **kwargs: order.append("audio-closed"),
     )
 
     session._process_chunks()
@@ -48,11 +49,12 @@ def test_realtime_session_reports_end_only_after_audio_cleanup(monkeypatch) -> N
     session.temporary_audio = object()
     session.repository = object()
     session.result = SimpleNamespace(id="realtime-course")
+    session.settings = SimpleNamespace(retain_audio_for_review=False)
     session.event = lambda name, payload: order.append(name)
     monkeypatch.setattr(realtime_live.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(
         realtime_live, "finish_temporary_audio",
-        lambda *args: order.append("audio-closed"),
+        lambda *args, **kwargs: order.append("audio-closed"),
     )
 
     session._finish()
@@ -110,11 +112,12 @@ def test_chunked_summary_failure_still_closes_backup_and_reports_end(monkeypatch
         set_course_state=lambda *args: order.append("needs-attention")
     )
     session.result = SimpleNamespace(id="chunked-course")
+    session.settings = SimpleNamespace(retain_audio_for_review=False)
     session.temporary_audio = object()
     session.event = lambda name, payload: order.append(name)
     monkeypatch.setattr(
         chunked_live, "finish_temporary_audio",
-        lambda *args: order.append("audio-closed"),
+        lambda *args, **kwargs: order.append("audio-closed"),
     )
 
     session._process_chunks()
@@ -144,12 +147,13 @@ def test_realtime_stream_stop_error_still_closes_transport_and_backup(monkeypatc
         set_course_state=lambda *args: order.append("needs-attention")
     )
     session.result = SimpleNamespace(id="realtime-course")
+    session.settings = SimpleNamespace(retain_audio_for_review=False)
     session.temporary_audio = object()
     session.event = lambda name, payload: order.append(name)
     monkeypatch.setattr(realtime_live.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(
         realtime_live, "finish_temporary_audio",
-        lambda *args: order.append("audio-closed"),
+        lambda *args, **kwargs: order.append("audio-closed"),
     )
 
     session._finish()

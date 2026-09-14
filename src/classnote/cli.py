@@ -40,7 +40,7 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         demo = args.command == "demo"
-        audio = Path(__file__) if demo else args.audio
+        audio = Path("offline-demo") if demo else args.audio
         terms = {} if demo else parse_terms(args.term)
         result, exported = process_course(
             audio,

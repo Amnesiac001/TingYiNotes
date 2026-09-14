@@ -416,11 +416,19 @@ class DemoTranscriber:
 
 class DemoTextProcessor:
     def translate(self, text: str, subject: str, terms: dict[str, str]) -> str:
-        return (
-            "今天我们将讨论 TCP 拥塞控制。拥塞窗口限制发送方在网络中尚未得到确认的"
-            "数据量。在慢启动阶段，拥塞窗口增长得很快。达到阈值后，TCP 进入拥塞避免"
-            "阶段，并以更谨慎的方式增长。"
-        )
+        translated: list[str] = []
+        if "Today we will discuss TCP congestion control." in text:
+            translated.append(
+                "今天我们将讨论 TCP 拥塞控制。拥塞窗口限制发送方在网络中尚未得到确认的数据量。"
+            )
+        if "During slow start, the congestion window grows quickly." in text:
+            translated.append(
+                "在慢启动阶段，拥塞窗口增长得很快。达到阈值后，TCP 进入拥塞避免阶段，"
+                "并以更谨慎的方式增长。"
+            )
+        if not translated:
+            raise ValueError("离线演示只支持内置示例内容。")
+        return " ".join(translated)
 
     def organize(
         self, title: str, subject: str, original: str, translation: str
@@ -492,11 +500,13 @@ class CoursePipeline:
         text_processor: TextProcessor,
         progress: ProgressCallback | None = None,
         usage_provider: str | None = None,
+        source_file_required: bool = True,
     ):
         self.transcriber = transcriber
         self.text_processor = text_processor
         self.progress = progress or (lambda _: None)
         self.usage_provider = usage_provider
+        self.source_file_required = source_file_required
 
     def run(
         self,
@@ -505,7 +515,7 @@ class CoursePipeline:
         subject: str,
         terms: dict[str, str] | None = None,
     ) -> CourseResult:
-        if not audio_path.exists():
+        if self.source_file_required and not audio_path.is_file():
             raise FileNotFoundError(f"找不到文件：{audio_path}")
         self.progress("正在转写英文音频……")
         segments = self.transcriber.transcribe(audio_path, subject)
@@ -525,7 +535,7 @@ class CoursePipeline:
         return CourseResult(
             title=title,
             subject=subject,
-            source_path=str(audio_path.resolve()),
+            source_path=str(audio_path.resolve()) if self.source_file_required else "",
             segments=segments,
             notes_markdown=notes,
         )
@@ -544,10 +554,11 @@ class CoursePipeline:
 
         if not isinstance(repository, CourseRepository):
             raise TypeError("repository 必须是 CourseRepository。")
-        if not audio_path.exists():
+        if self.source_file_required and not audio_path.is_file():
             raise FileNotFoundError(f"找不到文件：{audio_path}")
 
-        result = CourseResult(title, subject, str(audio_path.resolve()), [], "")
+        source_path = str(audio_path.resolve()) if self.source_file_required else ""
+        result = CourseResult(title, subject, source_path, [], "")
         repository.create_course(result, "transcribing")
         if self.usage_provider:
             bind_course_usage(

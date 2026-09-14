@@ -699,3 +699,30 @@ def test_live_and_file_processing_check_output_before_start(monkeypatch, tmp_pat
     file_page.close()
     window.close()
     app.processEvents()
+
+
+def test_file_page_offline_demo_does_not_use_source_file(monkeypatch, tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("CLASSNOTE_DB", str(tmp_path / "classnote.db"))
+    monkeypatch.setenv("CLASSNOTE_EXPORT_DIR", str(tmp_path / "notes"))
+    calls: list[tuple[Path, bool]] = []
+
+    def fake_process(audio: Path, *_args, demo: bool = False, **_kwargs):
+        calls.append((audio, demo))
+        return object(), tmp_path / "notes" / "demo.md"
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs) -> None:
+            self.target = target
+
+        def start(self) -> None:
+            self.target()
+
+    monkeypatch.setattr(qt_gui, "process_course", fake_process)
+    monkeypatch.setattr(qt_gui.threading, "Thread", ImmediateThread)
+    page = FilePage(Bridge(), CourseRepository(tmp_path / "classnote.db"))
+    page.start(demo=True)
+
+    assert calls == [(Path("offline-demo"), True)]
+    page.close()
+    app.processEvents()

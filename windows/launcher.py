@@ -52,6 +52,31 @@ def run_self_check() -> dict[str, object]:
     return report
 
 
+def run_release_smoke() -> dict[str, object]:
+    """Check the frozen offline demo and its persisted output without an API call."""
+    from classnote.app import process_course
+    from classnote.config import Settings
+    from classnote.storage import CourseRepository
+
+    result, exported = process_course(
+        Path("offline-demo"), "听译记发布验收", "计算机网络", demo=True,
+    )
+    saved = CourseRepository(Settings.load().database_path).get_course(result.id)
+    markdown = exported.read_text(encoding="utf-8")
+    if (
+        saved is None
+        or saved["status"] != "completed"
+        or saved["source_path"]
+        or len(result.segments) != 2
+        or not result.segments[0].translated_text
+        or not result.segments[1].translated_text
+        or result.segments[0].translated_text == result.segments[1].translated_text
+        or markdown.count("今天我们将讨论") != 1
+    ):
+        raise RuntimeError("离线演示未能完整保存课程和笔记。")
+    return {"demo_course_saved": True, "demo_export_ready": True, "demo_segments": 2}
+
+
 if getattr(sys, "frozen", False):
     app_data = application_data_dir()
     app_data.mkdir(parents=True, exist_ok=True)
@@ -59,11 +84,18 @@ if getattr(sys, "frozen", False):
 
 if __name__ == "__main__":
     check_mode = "--self-check" in sys.argv
+    release_smoke_mode = "--release-smoke" in sys.argv
     application_data_dir().mkdir(parents=True, exist_ok=True)
-    diagnostic = application_data_dir() / ("self-check.json" if check_mode else "startup.log")
+    diagnostic_name = (
+        "self-check.json" if check_mode else
+        "release-smoke.json" if release_smoke_mode else "startup.log"
+    )
+    diagnostic = application_data_dir() / diagnostic_name
     try:
         if check_mode:
             diagnostic.write_text(json.dumps(run_self_check(), ensure_ascii=False, indent=2), encoding="utf-8")
+        elif release_smoke_mode:
+            diagnostic.write_text(json.dumps(run_release_smoke(), ensure_ascii=False, indent=2), encoding="utf-8")
         else:
             diagnostic.write_text("Loading interface...\n", encoding="utf-8")
             from classnote.qt_gui import main  # noqa: E402
@@ -73,10 +105,11 @@ if __name__ == "__main__":
     except Exception:
         failure = traceback.format_exc()
         diagnostic.write_text(
-            json.dumps({"error": failure}, ensure_ascii=False, indent=2) if check_mode else failure,
+            json.dumps({"error": failure}, ensure_ascii=False, indent=2)
+            if check_mode or release_smoke_mode else failure,
             encoding="utf-8",
         )
-        if sys.platform == "win32" and not check_mode:
+        if sys.platform == "win32" and not check_mode and not release_smoke_mode:
             import ctypes
 
             ctypes.windll.user32.MessageBoxW(
@@ -85,6 +118,6 @@ if __name__ == "__main__":
                 "听译记",
                 0x10,
             )
-        if check_mode:
+        if check_mode or release_smoke_mode:
             raise SystemExit(1)
         raise

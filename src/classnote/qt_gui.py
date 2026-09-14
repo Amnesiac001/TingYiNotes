@@ -55,6 +55,7 @@ from .live_summary import LiveSummarySnapshot
 from .marked_context import MarkedContext, build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult, Segment
 from .paragraphs import group_segments, paragraph_time_bounds, should_start_new_paragraph
+from .preflight_dialog import PreflightDialog
 from .recent_index import RecentSegmentIndex
 from .recovery_center import RecoveryCenterDialog
 from .recovery_inventory import list_recovery_candidates
@@ -425,6 +426,7 @@ class HomePage(Page):
         settings: Settings,
         open_course: Callable[[str], None],
         open_recovery_center: Callable[[], None],
+        open_preflight: Callable[[], None] | None = None,
     ) -> None:
         super().__init__("最近课程")
         self.navigate = navigate
@@ -437,10 +439,13 @@ class HomePage(Page):
         start.clicked.connect(lambda: navigate(1))
         import_button = QPushButton("导入录音或视频")
         import_button.clicked.connect(lambda: navigate(2))
+        preflight_button = QPushButton("课前检查")
+        preflight_button.clicked.connect(open_preflight or (lambda: navigate(1)))
         self.service = QLabel()
         self.service.setObjectName("Muted")
         toolbar.addWidget(start)
         toolbar.addWidget(import_button)
+        toolbar.addWidget(preflight_button)
         toolbar.addStretch()
         toolbar.addWidget(self.service)
         self.layout.addLayout(toolbar)
@@ -2917,7 +2922,7 @@ class FilePage(Page):
         self.start_button.setEnabled(False)
         self.demo_button.setEnabled(False)
         self.progress.show()
-        audio = Path(__file__) if demo else Path(self.path)
+        audio = Path("offline-demo") if demo else Path(self.path)
         title = self.title_input.text().strip() or (f"{APP_NAME}演示课程" if demo else audio.stem)
         subject = self.subject_input.text().strip() or "通用课程"
 
@@ -3346,11 +3351,19 @@ class SettingsPage(Page):
             "课堂进行时写入本机 WAV；正常完成并导出后自动删除，失败或中断时保留供恢复。"
         )
         audio_retention_hint = QLabel(
-            "仅保存在课程数据库旁的 temporary-audio 文件夹；失败或中断时不会自动删除，请注意隐私和磁盘空间。"
+            "仅保存在课程数据库旁的 temporary-audio 文件夹；失败或中断时会保留。若开启课后保留，正常完成也不会自动删除，请注意隐私和磁盘空间。"
         )
         audio_retention_hint.setObjectName("Muted")
         audio_retention_hint.setWordWrap(True)
         speech_layout.addWidget(self.temporary_audio_check)
+        self.retain_review_audio_check = QCheckBox("课后保留录音，供逐句校对回听（默认关闭）")
+        self.retain_review_audio_check.setChecked(settings.retain_audio_for_review)
+        self.retain_review_audio_check.setEnabled(self.temporary_audio_check.isChecked())
+        self.temporary_audio_check.toggled.connect(self.retain_review_audio_check.setEnabled)
+        self.retain_review_audio_check.setToolTip(
+            "只有同时开启本地临时音频才会录制；完成课堂后不自动删除，请自行管理磁盘和隐私。"
+        )
+        speech_layout.addWidget(self.retain_review_audio_check)
         speech_layout.addWidget(audio_retention_hint)
         self.layout.addWidget(speech)
 
@@ -3762,6 +3775,9 @@ class SettingsPage(Page):
             "TEXT_BASE_URL": base_url if provider == "compatible" else ("https://api.deepseek.com" if provider == "deepseek" else ""),
             "CLASSNOTE_EXPORT_DIR": str(output_dir),
             "CLASSNOTE_TEMP_AUDIO": "true" if self.temporary_audio_check.isChecked() else "false",
+            "CLASSNOTE_RETAIN_REVIEW_AUDIO": "true" if (
+                self.temporary_audio_check.isChecked() and self.retain_review_audio_check.isChecked()
+            ) else "false",
             "CLASSNOTE_CLASS_BUDGET_USD": str(budget),
         }
         try:
@@ -3845,6 +3861,7 @@ class MainWindow(QMainWindow):
             self.settings,
             self.open_course,
             self.open_recovery_center,
+            self.open_preflight,
         )
         self.live_page = LivePage(
             self.bridge,
@@ -3875,6 +3892,14 @@ class MainWindow(QMainWindow):
     def open_course(self, course_id: str) -> None:
         self.navigate(3)
         self.library_page.select_course(course_id)
+
+    def open_preflight(self) -> None:
+        PreflightDialog(
+            self.navigate, self,
+            run_audio_test=self.live_page.test_audio_source,
+            run_model_warmup=self.settings_page.test_local_runtime,
+            run_api_test=self.settings_page.test_text_connection,
+        ).exec()
 
     def resume_course(self, course_id: str) -> None:
         self.navigate(3)

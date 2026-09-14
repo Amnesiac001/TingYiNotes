@@ -59,7 +59,7 @@ try {
     try {
         $env:APPDATA = $checkRoot
         foreach ($name in $isolatedVariables | Where-Object { $_ -ne "APPDATA" }) {
-            [Environment]::SetEnvironmentVariable($name, $null, "Process")
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
         }
         if ($modelSnapshot) {
             $env:TINGYI_SELF_CHECK_MODEL_PATH = $modelSnapshot.FullName
@@ -81,11 +81,31 @@ try {
         if ($modelSnapshot -and -not $report.model_inference_ready) {
             throw "Bundled offline model inference failed. Inspect: $reportFile"
         }
+        $demoProcess = Start-Process -FilePath $executable -ArgumentList "--release-smoke" -PassThru -WindowStyle Hidden
+        if (-not $demoProcess.WaitForExit(180000)) {
+            Stop-Process -Id $demoProcess.Id
+            throw "Bundled offline demo timed out. Inspect: $checkRoot"
+        }
+        $demoReportFile = Get-ChildItem -LiteralPath $checkRoot -Recurse -File -Filter "release-smoke.json" |
+            Select-Object -First 1
+        if ($demoProcess.ExitCode -ne 0 -or -not $demoReportFile) {
+            throw "Bundled offline demo failed. Inspect: $checkRoot"
+        }
+        $demoReport = Get-Content -LiteralPath $demoReportFile.FullName -Raw | ConvertFrom-Json
+        if (-not $demoReport.demo_course_saved -or -not $demoReport.demo_export_ready -or
+            $demoReport.demo_segments -ne 2) {
+            throw "Bundled offline demo reported incomplete output. Inspect: $demoReportFile"
+        }
         Write-Host "Bundled self-check: Qt $($report.qt_version), CUDA devices $($report.cuda_devices), audio inputs $($report.input_devices), model inference $($report.model_inference_ready)"
+        Write-Host "Bundled offline demo: course saved and Markdown exported"
     }
     finally {
         foreach ($name in $isolatedVariables) {
-            [Environment]::SetEnvironmentVariable($name, $originalValues[$name], "Process")
+            if ($null -eq $originalValues[$name]) {
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            } else {
+                [Environment]::SetEnvironmentVariable($name, $originalValues[$name], "Process")
+            }
         }
     }
 

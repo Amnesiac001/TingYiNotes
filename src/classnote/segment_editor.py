@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
 
 from .config import Settings
 from .editing import correct_course_segment, undo_course_segment_correction
+from .recovery_inventory import course_temporary_audio_path
+from .review_audio import load_review_clip, review_reasons
 from .storage import CourseRepository
 
 
@@ -41,6 +43,7 @@ class SegmentEditorDialog(QDialog):
         self.settings = settings or Settings.load()
         self.saved_any = False
         self._loading = False
+        self._playing = False
         self.rows = {
             str(row["id"]): dict(row)
             for row in repository.get_course_segments(course_id)
@@ -63,15 +66,37 @@ class SegmentEditorDialog(QDialog):
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索时间、英文或中文……")
         self.search.textChanged.connect(self._filter_rows)
+        self.review_only = QCheckBox("只看建议核对")
+        self.review_only.toggled.connect(lambda _: self._filter_rows(self.search.text()))
         self.list = QListWidget()
         self.list.setMinimumWidth(330)
         self.list.currentItemChanged.connect(self._select_item)
         left.addWidget(self.search)
+        left.addWidget(self.review_only)
         left.addWidget(self.list, 1)
         body.addLayout(left, 2)
         editors = QVBoxLayout()
         self.location = QLabel("请选择一句记录")
         self.location.setObjectName("Muted")
+        self.review_hint = QLabel()
+        self.review_hint.setObjectName("Muted")
+        self.review_hint.setWordWrap(True)
+        self.play_button = QPushButton("回听这句")
+        self.play_button.clicked.connect(self.play_current)
+        self.audio_path = course_temporary_audio_path(repository, course_id)
+        self.play_button.setEnabled(False)
+        self.play_button.setToolTip(
+            "播放这句前后少量上下文；音频仅从本机读取，不会上传。"
+            if self.audio_path else "没有保留的本机录音。可在设置中提前开启课后保留。"
+        )
+        self.delete_audio_button = QPushButton("删除本机录音")
+        self.delete_audio_button.setEnabled(self.audio_path is not None)
+        self.delete_audio_button.setToolTip("只删除这堂课的 WAV；字幕、笔记和课程记录不变")
+        self.delete_audio_button.clicked.connect(self.delete_audio)
+        audio_actions = QHBoxLayout()
+        audio_actions.addWidget(self.play_button)
+        audio_actions.addWidget(self.delete_audio_button)
+        audio_actions.addStretch()
         english_label = QLabel("英文原文")
         english_label.setObjectName("PaneTitle")
         self.english = QPlainTextEdit()
@@ -86,6 +111,8 @@ class SegmentEditorDialog(QDialog):
         self.chinese.textChanged.connect(self._update_save_state)
         self.keep_chinese.toggled.connect(self._update_save_state)
         editors.addWidget(self.location)
+        editors.addWidget(self.review_hint)
+        editors.addLayout(audio_actions)
         editors.addWidget(english_label)
         editors.addWidget(self.english, 1)
         editors.addWidget(chinese_label)
@@ -125,7 +152,8 @@ class SegmentEditorDialog(QDialog):
         time_text = _stamp(int(row["start_ms"]))
         english = " ".join(str(row["original_text"]).split())[:65]
         chinese = " ".join(str(row["translated_text"]).split())[:45] or "待补译"
-        return f"{time_text} · {english}\n{chinese}"
+        flag = "建议核对 · " if review_reasons(row) else ""
+        return f"{flag}{time_text} · {english}\n{chinese}"
 
     def _filter_rows(self, query: str) -> None:
         needle = query.strip().casefold()
@@ -136,7 +164,10 @@ class SegmentEditorDialog(QDialog):
                 f"{_stamp(int(row['start_ms']))} {_stamp(int(row['end_ms']))} "
                 f"{row['original_text']} {row['translated_text']}"
             ).casefold()
-            item.setHidden(bool(needle and needle not in searchable))
+            item.setHidden(bool(
+                (needle and needle not in searchable)
+                or (self.review_only.isChecked() and not review_reasons(row))
+            ))
 
     def _is_dirty(self) -> bool:
         row = self.rows.get(self.current_id)
@@ -188,6 +219,12 @@ class SegmentEditorDialog(QDialog):
                 f"{_stamp(int(row['start_ms']))}–{_stamp(int(row['end_ms']))}"
                 if row else "请选择一句记录"
             )
+            reasons = review_reasons(row) if row else []
+            self.review_hint.setText(
+                "建议核对：" + "、".join(reasons) + "。这是规则提示，不代表识别一定有错。"
+                if reasons else "暂无明显异常；识别仍可能有误，请按需回听。"
+            )
+            self.play_button.setEnabled(bool(row) and self.audio_path is not None)
             self.save_button.setEnabled(False)
             self.keep_chinese.setChecked(False)
             self.keep_chinese.hide()
@@ -196,6 +233,59 @@ class SegmentEditorDialog(QDialog):
             )
         finally:
             self._loading = False
+
+    def play_current(self) -> None:
+        row = self.rows.get(self.current_id)
+        if row is None:
+            return
+        try:
+            import sounddevice as sd
+
+            samples, rate = load_review_clip(
+                self.repository, self.course_id, int(row["start_ms"]), int(row["end_ms"])
+            )
+            sd.play(samples, rate, blocking=False)
+            self._playing = True
+            self.status.setText("正在播放本机录音片段；切换句子后可点击回听下一句。")
+        except Exception as exc:
+            QMessageBox.warning(self, "无法回听", str(exc))
+
+    def delete_audio(self) -> None:
+        path = self.audio_path
+        if path is None:
+            return
+        answer = QMessageBox.question(
+            self, "删除本机课堂录音？",
+            "只删除这堂课保留的 WAV 录音，不能撤销。英文、中文和笔记仍会保留。确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._stop_replay()
+        try:
+            # Re-check the UUID-scoped path; never delete a user-selected path.
+            current = course_temporary_audio_path(self.repository, self.course_id)
+            if current != path:
+                raise FileNotFoundError("录音位置已变化，请关闭校对窗口后重试。")
+            path.unlink()
+        except OSError as exc:
+            QMessageBox.warning(self, "未能删除录音", str(exc))
+            return
+        self.audio_path = None
+        self.play_button.setEnabled(False)
+        self.delete_audio_button.setEnabled(False)
+        self.status.setText("这堂课的本机录音已删除；字幕和笔记未变。")
+
+    def _stop_replay(self) -> None:
+        if self._playing:
+            try:
+                import sounddevice as sd
+
+                sd.stop()
+            except Exception:
+                pass
+            self._playing = False
 
     def save_current(self) -> None:
         row = self.rows.get(self.current_id)
@@ -267,6 +357,10 @@ class SegmentEditorDialog(QDialog):
         current_item = self.list.currentItem()
         if current_item is not None:
             current_item.setText(self._item_text(self.rows[self.current_id]))
+        self.review_hint.setText(
+            "建议核对：" + "、".join(review_reasons(self.rows[self.current_id]))
+            if review_reasons(self.rows[self.current_id]) else "暂无明显异常。"
+        )
         self._loading = True
         try:
             self.english.setPlainText(str(updated["original_text"]))
@@ -284,4 +378,5 @@ class SegmentEditorDialog(QDialog):
         if self._is_dirty() and not self._confirm_discard("关闭窗口会丢弃当前句尚未保存的文字。"):
             event.ignore()
             return
+        self._stop_replay()
         super().closeEvent(event)

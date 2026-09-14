@@ -465,6 +465,7 @@ class ChunkedLiveCourseSession:
             finish_temporary_audio(
                 self.temporary_audio, self.repository, self.result.id,
                 lambda message: self.event("warning", message),
+                retain_completed=getattr(self.settings, "retain_audio_for_review", False),
             )
             raise
         self.repository.set_course_state(self.result.id, "transcribing")
@@ -561,6 +562,7 @@ class ChunkedLiveCourseSession:
                 finish_temporary_audio(
                     self.temporary_audio, self.repository, self.result.id,
                     lambda message: self.event("warning", message),
+                    retain_completed=getattr(self.settings, "retain_audio_for_review", False),
                 )
             finally:
                 self.event("session_ended", self.result.id)

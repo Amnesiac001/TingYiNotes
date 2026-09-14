@@ -93,6 +93,18 @@ def test_relative_data_paths_follow_config_directory_not_cwd(monkeypatch, tmp_pa
     assert settings.export_dir == config_dir / "notes"
 
 
+def test_empty_data_paths_use_safe_defaults(monkeypatch, tmp_path: Path) -> None:
+    config_dir = tmp_path / "settings"
+    monkeypatch.setenv("CLASSNOTE_ENV_FILE", str(config_dir / ".env"))
+    monkeypatch.setenv("CLASSNOTE_DB", "")
+    monkeypatch.setenv("CLASSNOTE_EXPORT_DIR", "")
+
+    settings = Settings.load()
+
+    assert settings.database_path == config_dir / "data" / "classnote.db"
+    assert settings.export_dir == config_dir / "exports"
+
+
 def test_new_process_loads_saved_env_from_explicit_path_outside_cwd(tmp_path: Path) -> None:
     config_dir = tmp_path / "settings"
     config_dir.mkdir()
