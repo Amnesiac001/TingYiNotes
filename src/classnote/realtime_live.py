@@ -118,6 +118,7 @@ class RealtimeLiveCourseSession:
             self.result, self.text_processor, title, subject, event
         )
         self.translations.on_translated = self.live_summary.submit
+        self.live_summary.translation_busy = self.translations.has_pending_work
         self.stop_event = threading.Event()
         self.started_monotonic = 0.0
         self.partial_by_item: dict[str, str] = {}
@@ -269,9 +270,15 @@ class RealtimeLiveCourseSession:
             self.partial_by_item.pop(event.item_id, None)
             if text:
                 start = self.start_by_item.pop(event.item_id, max(0, self._elapsed_ms() - 3000))
-                end = self.end_by_item.pop(event.item_id, self._elapsed_ms())
+                measured_end = self.end_by_item.pop(event.item_id, None)
+                end = measured_end if measured_end is not None else self._elapsed_ms()
                 self.event("final_original", (event.item_id, text, start))
-                self.translations.submit(text, start, end)
+                english_lag_ms = self._elapsed_ms() - end
+                self.translations.submit(
+                    text, start, end,
+                    english_lag_ms=english_lag_ms
+                    if measured_end is not None and 0 <= english_lag_ms <= 300_000 else None,
+                )
         elif event.kind == "error":
             self.event("warning", f"Realtime API：{event.message}")
         elif event.kind == "session_updated":

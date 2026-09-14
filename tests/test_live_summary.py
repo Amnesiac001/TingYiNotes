@@ -210,3 +210,37 @@ def test_budget_pause_keeps_existing_summary_without_new_request() -> None:
     assert coordinator.queue.empty()
     assert processor.calls == []
     assert coordinator._pending_count() == 1
+
+
+def test_summary_waits_for_translation_and_catches_up_without_new_speech() -> None:
+    segments = [Segment(f"English {i}", f"中文 {i}", i * 1000, (i + 1) * 1000) for i in range(3)]
+    result = CourseResult("课", "网络", "mic", segments, "")
+    processor = SummaryProcessor()
+    busy = True
+    paused = threading.Event()
+    updated = threading.Event()
+    states: list[str] = []
+
+    def receive(name, payload):
+        if name == "summary_status":
+            states.append(payload["state"])
+            if payload["state"] == "paused_translation":
+                paused.set()
+        if name == "summary_update":
+            updated.set()
+
+    coordinator = LiveSummaryCoordinator(
+        result, processor, "课", "网络", receive,
+        min_segments=3, min_interval=999,
+        translation_busy=lambda: busy,
+    )
+    coordinator.start()
+    for segment in segments:
+        coordinator.submit(segment)
+    assert paused.wait(timeout=2)
+    assert processor.calls == []
+    busy = False
+    assert updated.wait(timeout=3)
+    coordinator.close()
+    assert processor.calls == [("English 0\nEnglish 1\nEnglish 2", "中文 0\n中文 1\n中文 2")]
+    assert "updated" in states

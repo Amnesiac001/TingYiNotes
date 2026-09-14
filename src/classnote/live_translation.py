@@ -23,6 +23,7 @@ class TranslationJob:
     segment: Segment
     attempt: int = 0
     queued_at: float = 0.0
+    english_lag_ms: int | None = None
 
 
 def protected_tokens(text: str) -> set[str]:
@@ -82,7 +83,10 @@ class LiveTranslationCoordinator:
             thread.start()
             self.threads.append(thread)
 
-    def submit(self, original: str, start_ms: int, end_ms: int) -> Segment:
+    def submit(
+        self, original: str, start_ms: int, end_ms: int,
+        *, english_lag_ms: int | None = None,
+    ) -> Segment:
         text = original.strip()
         if not text:
             raise ValueError("不能提交空字幕。")
@@ -95,7 +99,11 @@ class LiveTranslationCoordinator:
         # The English transcript is durable before any network request starts.
         self.repository.add_segment(self.result.id, segment, order, "pending")
         self.event("segment_original", segment)
-        job = TranslationJob(segment=segment, queued_at=time.monotonic())
+        if english_lag_ms is not None:
+            self.event("latency_sample", {"stage": "english", "ms": max(0, english_lag_ms)})
+        job = TranslationJob(
+            segment=segment, queued_at=time.monotonic(), english_lag_ms=english_lag_ms,
+        )
         if self._closed:
             message = "课堂正在结束，英文已保存，可在课程库中补译。"
             self.repository.set_translation_state(
@@ -281,7 +289,7 @@ class LiveTranslationCoordinator:
                 return
             self.repository.set_translation_state(segment.id, "translating")
         try:
-            translated = self._stream_or_translate(segment)
+            translated = self._stream_or_translate(job)
             if not translated:
                 raise RuntimeError("翻译服务没有返回内容。")
             with self._lock:
@@ -291,6 +299,7 @@ class LiveTranslationCoordinator:
                 self.repository.set_translation_state(segment.id, "completed", translated)
                 self._retrying_ids.discard(segment.id)
             self.event("segment_update", segment)
+            self._emit_translation_latency(job, "chinese_complete")
             if self.on_translated is not None:
                 try:
                     self.on_translated(segment)
@@ -299,6 +308,7 @@ class LiveTranslationCoordinator:
             missing = protected_tokens(segment.original_text) - protected_tokens(translated)
             if missing:
                 values = "、".join(sorted(missing)[:5])
+                self.event("quality_sample", {"stage": "protected_token_mismatch", "segment_id": segment.id})
                 self.event("warning", f"已保留英文原文；请留意本句中的数字或缩写：{values}")
         except BudgetLimitReached as exc:
             with self._lock:
@@ -331,15 +341,20 @@ class LiveTranslationCoordinator:
             self.event("translation_failed", (segment.id, str(exc)))
             self.event("warning", f"一句中文翻译失败，英文已保存：{exc}")
 
-    def _stream_or_translate(self, segment: Segment) -> str:
+    def _stream_or_translate(self, job: TranslationJob) -> str:
+        segment = job.segment
         stream_method = getattr(self.text_processor, "translate_stream", None)
         if not callable(stream_method):
-            return self.text_processor.translate(
+            result = self.text_processor.translate(
                 segment.original_text, self.subject,
                 relevant_terms(segment.original_text, self.terms),
             ).strip()
+            if result:
+                self._emit_translation_latency(job, "chinese_first")
+            return result
         parts: list[str] = []
         last_emit = 0.0
+        first_seen = False
         for delta in stream_method(
             segment.original_text, self.subject,
             relevant_terms(segment.original_text, self.terms),
@@ -347,6 +362,9 @@ class LiveTranslationCoordinator:
             with self._lock:
                 if self._abandon_late_results:
                     return ""
+            if str(delta).strip() and not first_seen:
+                first_seen = True
+                self._emit_translation_latency(job, "chinese_first")
             parts.append(str(delta))
             now = time.monotonic()
             if now - last_emit >= 0.05:
@@ -356,6 +374,13 @@ class LiveTranslationCoordinator:
         if translated:
             self._emit_translation_delta(segment.id, translated)
         return translated
+
+    def _emit_translation_latency(self, job: TranslationJob, stage: str) -> None:
+        elapsed = max(0, int((time.monotonic() - job.queued_at) * 1000))
+        payload: dict[str, object] = {"stage": stage, "ms": elapsed}
+        if job.english_lag_ms is not None:
+            payload["from_speech_end_ms"] = max(0, job.english_lag_ms) + elapsed
+        self.event("latency_sample", payload)
 
     def _emit_translation_delta(self, segment_id: str, text: str) -> None:
         with self._lock:
@@ -379,3 +404,10 @@ class LiveTranslationCoordinator:
                 "last_queue_wait_ms": last_queue_wait_ms,
             },
         )
+
+    def has_pending_work(self) -> bool:
+        """Cheap readiness probe for lower-priority background summaries."""
+        with self._lock:
+            active = self._active_jobs
+            deferred = len(self._deferred)
+        return bool(active or deferred or not self.queue.empty())

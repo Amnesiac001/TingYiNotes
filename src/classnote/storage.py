@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -87,11 +88,41 @@ CREATE TABLE IF NOT EXISTS text_usage_events (
 );
 CREATE INDEX IF NOT EXISTS idx_text_usage_course
 ON text_usage_events(course_id, used_at);
+CREATE TABLE IF NOT EXISTS course_quality_metrics (
+    course_id TEXT PRIMARY KEY,
+    summary_json TEXT NOT NULL,
+    FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
+);
 """
 
 
 class CourseRepository:
     MAX_SUBJECT_TERMS = 80
+
+    def save_course_quality_metrics(self, course_id: str, summary: dict[str, object]) -> None:
+        """Persist only bounded timing aggregates, never audio or transcript copies."""
+        encoded = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded) > 4096:
+            raise ValueError("课堂性能统计过大，已拒绝保存。")
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO course_quality_metrics (course_id, summary_json)
+                   VALUES (?, ?) ON CONFLICT(course_id) DO UPDATE SET summary_json = excluded.summary_json""",
+                (course_id, encoded),
+            )
+
+    def get_course_quality_metrics(self, course_id: str) -> dict[str, object]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT summary_json FROM course_quality_metrics WHERE course_id = ?", (course_id,)
+            ).fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(str(row["summary_json"]))
+            return value if isinstance(value, dict) else {}
+        except (TypeError, ValueError):
+            return {}
 
     def __init__(self, database_path: Path):
         self.database_path = database_path

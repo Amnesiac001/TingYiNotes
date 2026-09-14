@@ -85,6 +85,7 @@ class LiveSummaryCoordinator:
         min_interval: float = 45.0,
         max_context_segments: int = 24,
         clock: Callable[[], float] = time.monotonic,
+        translation_busy: Callable[[], bool] | None = None,
     ) -> None:
         self.result = result
         self.text_processor = text_processor
@@ -95,6 +96,7 @@ class LiveSummaryCoordinator:
         self.min_interval = max(0.0, min_interval)
         self.max_context_segments = max(1, max_context_segments)
         self.clock = clock
+        self.translation_busy = translation_busy
         self.queue: queue.Queue[Segment | None] = queue.Queue(maxsize=64)
         self.thread: threading.Thread | None = None
         self._closed = False
@@ -103,6 +105,8 @@ class LiveSummaryCoordinator:
         self._summarized_ids: set[str] = set()
         self._latest_summarized_end_ms = -1
         self._warning_shown = False
+        self._paused_for_translation = False
+        self._resume_pending = False
 
     def start(self) -> None:
         if self.thread is not None:
@@ -143,9 +147,9 @@ class LiveSummaryCoordinator:
             except queue.Empty:
                 if self._closed:
                     return
-                threshold = 1 if self._summarized_ids else 3
+                threshold = 1 if self._resume_pending or self._summarized_ids else 3
                 if (
-                    self.clock() - self._last_run >= self.min_interval
+                    (self._resume_pending or self.clock() - self._last_run >= self.min_interval)
                     and self._pending_count() >= threshold
                 ):
                     completed = 0
@@ -193,12 +197,23 @@ class LiveSummaryCoordinator:
     def _summarize(self) -> None:
         if self._budget_paused():
             return
+        if self.translation_busy is not None and self.translation_busy():
+            if self._pending_count():
+                self._resume_pending = True
+                if not self._paused_for_translation:
+                    self._paused_for_translation = True
+                    self.event("summary_status", {"state": "paused_translation"})
+            return
+        if self._paused_for_translation:
+            self._paused_for_translation = False
+            self.event("summary_status", {"state": "waiting"})
         method = getattr(self.text_processor, "summarize_live", None)
         if not callable(method):
             return
         segments = self._pending_segments()[:self.max_context_segments]
         if not segments:
             return
+        self._resume_pending = False
         original = "\n".join(
             f"{self.result._marker_prefix(segment.marker)}{segment.original_text}"
             for segment in segments

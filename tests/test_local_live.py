@@ -222,7 +222,7 @@ def test_buffered_opening_audio_keeps_its_original_timestamp() -> None:
     submitted: list[tuple[str, int, int]] = []
 
     class Translations:
-        def submit(self, text: str, start_ms: int, end_ms: int) -> None:
+        def submit(self, text: str, start_ms: int, end_ms: int, **kwargs) -> None:
             submitted.append((text, start_ms, end_ms))
 
     session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
@@ -263,7 +263,7 @@ def test_long_pause_splits_audio_without_allocating_silent_minutes() -> None:
     session.dropped_blocks = 0
     session.event = lambda *args: None
     session.translations = SimpleNamespace(
-        submit=lambda text, start, end: submitted.append((text, start, end))
+        submit=lambda text, start, end, **kwargs: submitted.append((text, start, end))
     )
 
     def transcribe(model, audio):
@@ -296,7 +296,7 @@ def test_pause_flush_processes_pending_audio_after_a_gap() -> None:
     session.dropped_blocks = 0
     session.event = lambda *args: None
 
-    def submit(text, start, end):
+    def submit(text, start, end, **kwargs):
         submitted.append((text, start, end))
         if len(submitted) == 2:
             session.stop_event.set()
@@ -375,7 +375,7 @@ def test_backed_up_fast_speech_is_still_saved_on_final_pass() -> None:
     session.dropped_blocks = 0
     session.event = lambda *args: None
     session.translations = SimpleNamespace(
-        submit=lambda text, start, end: submitted.append((text, start, end))
+        submit=lambda text, start, end, **kwargs: submitted.append((text, start, end))
     )
     session._transcribe = lambda model, audio: "Fast lecture."
     speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
@@ -398,7 +398,7 @@ def test_vad_final_pass_keeps_a_short_last_fragment() -> None:
     session.dropped_blocks = 0
     session.event = lambda *args: None
     session.translations = SimpleNamespace(
-        submit=lambda text, start, end: submitted.append((text, start, end))
+        submit=lambda text, start, end, **kwargs: submitted.append((text, start, end))
     )
     session._transcribe = lambda model, audio: "Last word."
     speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
@@ -420,7 +420,7 @@ def test_asr_metrics_include_audio_waiting_behind_inference() -> None:
     session.settings = SimpleNamespace(local_refresh_ms=800)
     session.dropped_blocks = 0
     session.event = lambda name, payload: events.append((name, payload))
-    session.translations = SimpleNamespace(submit=lambda *args: None)
+    session.translations = SimpleNamespace(submit=lambda *args, **kwargs: None)
     first_inference = True
 
     def transcribe(model, audio):
@@ -478,7 +478,7 @@ def test_stop_drains_buffered_audio_even_when_model_loaded_during_pause() -> Non
     session.dropped_blocks = 0
     session.event = lambda *args: None
     session.translations = SimpleNamespace(
-        submit=lambda text, start, end: submitted.append((text, start, end))
+        submit=lambda text, start, end, **kwargs: submitted.append((text, start, end))
     )
     session._transcribe = lambda model, audio: "Opening sentence."
     speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
@@ -514,7 +514,7 @@ def test_pause_drains_queued_audio_as_one_sentence() -> None:
     session.dropped_blocks = 0
     session.event = lambda *args: None
 
-    def submit(text: str, start: int, end: int) -> None:
+    def submit(text: str, start: int, end: int, **kwargs) -> None:
         submitted.append((text, start, end))
         translated.set()
 

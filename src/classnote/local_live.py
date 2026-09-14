@@ -252,6 +252,7 @@ class LocalLiveCourseSession:
             terms=self.course_context.terms,
             on_translated=self.live_summary.submit,
         )
+        self.live_summary.translation_busy = self.translations.has_pending_work
         self.audio_queue: queue.Queue[tuple[bytes, int]] = queue.Queue(
             maxsize=self.MAX_AUDIO_BUFFER_SECONDS * 1000 // self.AUDIO_BLOCK_MS
         )
@@ -655,7 +656,11 @@ class LocalLiveCourseSession:
                     (buffer_start_ms or 0)
                     + int(speech[-1]["end"] / self.SAMPLE_RATE * 1000),
                 )
-                self.translations.submit(hypothesis, start_ms, end_ms)
+                english_lag_ms = self._elapsed_ms() - end_ms
+                self.translations.submit(
+                    hypothesis, start_ms, end_ms,
+                    english_lag_ms=english_lag_ms if 0 <= english_lag_ms <= 300_000 else None,
+                )
                 self.event("partial_clear", "local-current")
                 # Keep trailing audio only at a natural silence boundary. A forced
                 # 10-second split can end on speech; carrying it forward duplicated words.

@@ -50,6 +50,29 @@ def test_live_translation_persists_english_then_updates_chinese(tmp_path: Path) 
     assert metric_payloads[-1]["translation_queue"] == 0
     assert metric_payloads[-1]["last_translation_ms"] >= 0
     assert translated_callbacks == [segment]
+    latency = [payload for name, payload in events if name == "latency_sample"]
+    assert {sample["stage"] for sample in latency} == {"chinese_first", "chinese_complete"}
+    assert all(sample["ms"] >= 0 for sample in latency)
+    assert coordinator.has_pending_work() is False
+
+
+def test_live_translation_reports_estimated_end_to_end_latency(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "timing.db")
+    result = CourseResult("课", "网络", "local:mic", [], "")
+    repository.create_course(result)
+    events: list[tuple[str, object]] = []
+    coordinator = LiveTranslationCoordinator(
+        result, repository, StreamingProcessor(), "网络",
+        lambda name, payload: events.append((name, payload)), workers=1,
+    )
+    coordinator.start()
+    coordinator.submit("TCP window 15 USB", 0, 1000, english_lag_ms=550)
+    coordinator.close_and_wait()
+    samples = [payload for name, payload in events if name == "latency_sample"]
+    assert any(item == {"stage": "english", "ms": 550} for item in samples)
+    first = next(item for item in samples if item["stage"] == "chinese_first")
+    assert first["from_speech_end_ms"] == 550 + first["ms"]
+    assert any(name == "quality_sample" for name, _ in events)
 
 
 def test_protected_tokens_extracts_numbers_and_acronyms() -> None:

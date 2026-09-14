@@ -52,6 +52,7 @@ from .config import Settings, save_env_settings, verify_output_directory
 from .courseware import CourseContext, build_course_context, merge_subject_context
 from .live import AudioDevice, AudioLevelResult, LiveCourseSession, capture_audio_level, list_input_devices
 from .live_summary import LiveSummarySnapshot
+from .latency_metrics import LatencyWindow, format_quality_summary
 from .marked_context import MarkedContext, build_marked_contexts, marked_contexts_markdown
 from .models import CourseResult, Segment
 from .paragraphs import group_segments, paragraph_time_bounds, should_start_new_paragraph
@@ -1319,6 +1320,8 @@ class SummaryPane(QFrame):
             self.hint.setText("等待下次更新")
         elif state == "paused_budget":
             self.hint.setText("预算节省中 · 摘要暂停")
+        elif state == "paused_translation":
+            self.hint.setText("优先翻译 · 摘要稍后补上")
 
     def reset(self) -> None:
         self.snapshot = LiveSummarySnapshot()
@@ -1362,6 +1365,8 @@ class LivePage(Page):
         self.last_asr_metrics: dict[str, int] = {
             "inference_ms": 0, "audio_ms": 1, "queued_ms": 0,
         }
+        self.latency_stats = LatencyWindow()
+        self.protected_mismatch_ids: set[str] = set()
         self.transcript_cards: dict[str, ParagraphCard] = {}
         self.paragraph_cards: list[ParagraphCard] = []
         self.paragraph_groups: list[list[Segment]] = []
@@ -1493,6 +1498,10 @@ class LivePage(Page):
         self.audio_quality = QLabel("音源 等待")
         self.asr_quality = QLabel("识别 等待")
         self.translation_quality = QLabel("翻译 等待")
+        self.latency_quality = QLabel("首字 等待")
+        self.latency_quality.setToolTip("英文确认到首个中文片段返回的时间；样本足够后显示中位数与 P95")
+        self.review_quality = QLabel("核对 0")
+        self.review_quality.hide()
         self.drop_quality = QLabel("音频完整")
         self.save_quality = QLabel("已保存 0 句")
         self.save_quality.setToolTip("英文字幕会先写入本地课程库，再开始网络翻译")
@@ -1505,6 +1514,8 @@ class LivePage(Page):
             self.audio_quality,
             self.asr_quality,
             self.translation_quality,
+            self.latency_quality,
+            self.review_quality,
             self.drop_quality,
             self.save_quality,
             self.usage_quality,
@@ -1519,6 +1530,8 @@ class LivePage(Page):
         quality_layout.addWidget(self.audio_quality)
         quality_layout.addWidget(self.asr_quality)
         quality_layout.addWidget(self.translation_quality)
+        quality_layout.addWidget(self.latency_quality)
+        quality_layout.addWidget(self.review_quality)
         quality_layout.addWidget(self.drop_quality)
         quality_layout.addWidget(self.save_quality)
         quality_layout.addWidget(self.usage_quality)
@@ -2179,6 +2192,43 @@ class LivePage(Page):
             + (f"另有 {failed} 句需在段落中重试或课后补译。" if failed else "")
         )
 
+    def update_latency_quality(self, payload: object) -> None:
+        if not self.latency_stats.add(payload):
+            return
+        first_p50 = self.latency_stats.percentile("chinese_first", 50)
+        first_p95 = self.latency_stats.percentile("chinese_first", 95)
+        if first_p50 is not None and first_p95 is not None:
+            count = self.latency_stats.count("chinese_first")
+            self.latency_quality.setText(
+                f"首字 {first_p50 / 1000:.1f}s"
+                + (f" / {first_p95 / 1000:.1f}s" if count >= 5 else "")
+            )
+        details = []
+        for stage, label in (
+            ("english", "说话结束→英文确认（估算）"),
+            ("chinese_first", "英文确认→中文首片段返回"),
+            ("chinese_complete", "英文确认→中文完成"),
+            ("speech_to_chinese_first", "说话结束→中文首片段返回（估算）"),
+        ):
+            median = self.latency_stats.percentile(stage, 50)
+            slow = self.latency_stats.percentile(stage, 95)
+            if median is not None and slow is not None:
+                details.append(
+                    f"{label}：中位数 {median / 1000:.2f}s"
+                    + (f" · P95 {slow / 1000:.2f}s" if self.latency_stats.count(stage) >= 5 else "")
+                    + f" · {self.latency_stats.count(stage)} 次"
+                )
+        self.latency_quality.setToolTip("本次课堂最多 5000 次可用样本；不是准确率。\n" + "\n".join(details))
+
+    def save_quality_summary(self, course_id: str) -> None:
+        summary = self.latency_stats.summary(len(self.protected_mismatch_ids))
+        if not summary["stages"] and not summary["protected_mismatch_count"]:
+            return
+        try:
+            self.repository.save_course_quality_metrics(course_id, summary)
+        except Exception as exc:
+            self.notice.show_notice(f"课堂性能统计未能保存：{friendly_error(exc)}", error=False)
+
     def start(self) -> None:
         if self.cleanup_pending:
             self.notice.show_notice("上一节课堂仍在安全收尾，请稍候再开始新课堂。", error=False)
@@ -2329,6 +2379,19 @@ class LivePage(Page):
             self.update_translation(segment.id, segment.translated_text)  # type: ignore[attr-defined]
             if segment.id == self.latest_segment_id:  # type: ignore[attr-defined]
                 self.summary.observe_segment(segment)  # type: ignore[arg-type]
+        elif name == "latency_sample":
+            self.update_latency_quality(payload)
+        elif name == "quality_sample" and isinstance(payload, dict):
+            if payload.get("stage") == "protected_token_mismatch":
+                segment_id = str(payload.get("segment_id", ""))
+                if segment_id:
+                    self.protected_mismatch_ids.add(segment_id)
+                    count = len(self.protected_mismatch_ids)
+                    self.review_quality.setText(f"核对 {count}")
+                    self.review_quality.setToolTip(
+                        "有些英文数字或缩写未在中文译文中原样出现，建议课后核对；不等于翻译一定错误。"
+                    )
+                    self.review_quality.show()
         elif name == "summary_update":
             if isinstance(payload, LiveSummarySnapshot):
                 self.summary.apply_snapshot(payload)
@@ -2463,6 +2526,7 @@ class LivePage(Page):
             self.notice.show_notice(friendly_error(payload), error=False)
         elif name == "finished":
             result, path = payload  # type: ignore[misc]
+            self.save_quality_summary(result.id)
             self.status.setText(f"课堂笔记已导出：{path}")
             row = self.repository.get_course(result.id)
             needs_attention = row is not None and str(row["status"]) == "needs_attention"
@@ -2486,9 +2550,13 @@ class LivePage(Page):
                     f"《{result.title}》已完成。\n\n笔记位置：{path}",
                 )
         elif name == "error":
+            result = getattr(self.session, "result", None)
+            if result is not None:
+                self.save_quality_summary(str(result.id))
             self.notice.show_notice(friendly_error(payload), "检查设置", error=True)
             self.reset()
         elif name == "session_ended":
+            self.save_quality_summary(str(payload))
             self.cleanup_pending = False
             self.suppress_finish_dialog = False
             if self.session is None:
@@ -2753,6 +2821,11 @@ class LivePage(Page):
         self.auto_follow = True
         self.unseen_segments = 0
         self.saved_segment_count = 0
+        self.latency_stats = LatencyWindow()
+        self.latency_quality.setText("首字 等待")
+        self.latency_quality.setToolTip("英文确认到首个中文片段返回的时间；样本足够后显示中位数与 P95")
+        self.protected_mismatch_ids.clear()
+        self.review_quality.hide()
         self.save_quality.setText("已保存 0 句")
         self.usage_quality.setText("文本用量 等待")
         self.usage_quality.setToolTip("仅统计文本服务返回的 Token；费用为单价快照估算，不含云端语音")
@@ -3266,12 +3339,18 @@ class LibraryPage(Page):
         usage_section = format_usage_summary(
             self.repository.get_text_usage_summary(str(row["id"]))
         ).replace("\n", "\n\n")
+        quality_section = format_quality_summary(
+            self.repository.get_course_quality_metrics(str(row["id"]))
+        ).replace("\n", "\n\n")
+        if quality_section:
+            quality_section = f"---\n\n## 本次课堂性能\n\n{quality_section}\n\n"
         self.preview.setMarkdown(
             f"# {row['title']}\n\n"
             f"{row['subject']} · {lifecycle}{issue}\n\n"
             f"---\n\n## 课堂脉络\n\n{topics_section}\n\n"
             f"---\n\n## 整理笔记\n\n{notes_section}\n\n"
             f"---\n\n## 文本 API 用量\n\n{usage_section}\n\n"
+            f"{quality_section}"
             f"{marked_section}"
             f"---\n\n## 英中对照逐字稿\n\n{transcript_section}"
         )

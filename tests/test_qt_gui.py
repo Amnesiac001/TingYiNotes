@@ -104,6 +104,45 @@ def test_friendly_error_distinguishes_invalid_key_from_missing_key() -> None:
     assert "尚未配置" not in message
 
 
+def test_live_quality_strip_shows_measured_latency_not_accuracy(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    page = LivePage(
+        Bridge(), lambda *_: None, lambda *_: None, lambda: None,
+        CourseRepository(tmp_path / "metrics.db"),
+    )
+    for value in (200, 300, 400, 500, 600):
+        page.handle_event("latency_sample", {
+            "stage": "chinese_first", "ms": value,
+            "from_speech_end_ms": value + 500,
+        })
+    assert "0.4s / 0.6s" in page.latency_quality.text()
+    assert "P95" in page.latency_quality.toolTip()
+    assert "不是准确率" in page.latency_quality.toolTip()
+    page.handle_event("quality_sample", {
+        "stage": "protected_token_mismatch", "segment_id": "one",
+    })
+    assert page.review_quality.text() == "核对 1"
+    course = CourseResult("课堂", "网络", "mic", [], "")
+    page.repository.create_course(course)
+    page.save_quality_summary(course.id)
+    saved = page.repository.get_course_quality_metrics(course.id)
+    assert saved["stages"]["chinese_first"]["count"] == 5
+    assert saved["protected_mismatch_count"] == 1
+    library = LibraryPage(page.repository)
+    library.select_course(course.id)
+    assert "本次课堂性能" in library.preview.toPlainText()
+    library.close()
+    page.handle_event("quality_sample", {
+        "stage": "protected_token_mismatch", "segment_id": "one",
+    })
+    assert page.review_quality.text() == "核对 1"
+    page.clear_session_content()
+    assert page.latency_quality.text() == "首字 等待"
+    assert not page.review_quality.isVisible()
+    page.close()
+    app.processEvents()
+
+
 def test_recovery_error_keeps_pending_count_and_actionable_cause() -> None:
     message = friendly_error(
         "连续 2 句补译失败，已暂停后续请求；仍有 5 句待补译。"

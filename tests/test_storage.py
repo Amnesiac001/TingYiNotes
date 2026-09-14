@@ -177,6 +177,25 @@ def test_repository_migrates_legacy_segments_without_losing_text(tmp_path: Path)
     assert course["status"] == "needs_attention"
     assert course["updated_at"] == "now"
     assert course["notes_draft_ready"] == 0
+    repository.save_course_quality_metrics("c", {
+        "version": 1,
+        "stages": {"chinese_first": {"count": 1, "p50_ms": 350, "p95_ms": 350}},
+        "protected_mismatch_count": 0,
+    })
+    assert repository.get_course_quality_metrics("c")["stages"]["chinese_first"]["p50_ms"] == 350
+    assert repository.get_course_quality_metrics("missing") == {}
+
+
+def test_quality_aggregates_are_removed_with_course(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "quality.db")
+    course = CourseResult("课", "网络", "mic", [], "")
+    repository.create_course(course)
+    repository.save_course_quality_metrics(course.id, {
+        "version": 1, "stages": {"chinese_first": {"count": 1, "p50_ms": 450, "p95_ms": 450}},
+    })
+    assert repository.get_course_quality_metrics(course.id)
+    assert repository.delete_course(course.id)
+    assert repository.get_course_quality_metrics(course.id) == {}
 
 
 def test_repository_persists_and_validates_classroom_markers(tmp_path: Path) -> None:
