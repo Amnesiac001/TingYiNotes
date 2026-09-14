@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = [IO.Path]::GetFullPath((Split-Path -Parent $MyInvocation.MyCommand.Path))
 $releaseRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot "release"))
-$archive = [IO.Path]::GetFullPath((Join-Path $releaseRoot "TingYiNotes-0.2.0-Windows.zip"))
+$archive = [IO.Path]::GetFullPath((Join-Path $releaseRoot "TingYiNotes-0.2.1-Windows.zip"))
 $releasePrefix = $releaseRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
 if (-not $archive.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Release archive escaped the release directory: $archive"

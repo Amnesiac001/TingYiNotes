@@ -199,6 +199,98 @@ def test_live_page_waits_for_audio_cleanup_before_enabling_next_class(monkeypatc
     app.processEvents()
 
 
+def test_asr_quality_shows_real_audio_backlog_before_inference_speed(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "quality.db")
+    page = LivePage(Bridge(), lambda *_: None, lambda *_: None, lambda: None, repository)
+
+    page.update_asr_quality({"inference_ms": 100, "audio_ms": 1000, "queued_ms": 5400})
+    assert "积压 5.4s" in page.asr_quality.text()
+    page.update_asr_quality({"inference_ms": 100, "audio_ms": 1000, "queued_ms": 0})
+    assert "流畅" in page.asr_quality.text()
+
+    page.close()
+    app.processEvents()
+
+
+def test_backlog_status_without_inference_never_claims_zero_ms_speed(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    repository = CourseRepository(tmp_path / "backlog.db")
+    page = LivePage(Bridge(), lambda *_: None, lambda *_: None, lambda: None, repository)
+
+    page.handle_event("asr_backlog", {"queued_ms": 6000})
+    assert "积压 6.0s" in page.asr_quality.text()
+    assert "0ms" not in page.asr_quality.text()
+    page.handle_event("asr_backlog", {"queued_ms": 4970, "backlog_level": 2})
+    assert "识别 积压 5.0s" in page.asr_quality.text()
+    page.handle_event("asr_backlog", {"queued_ms": 0})
+    assert "等待英文" in page.asr_quality.text()
+
+    page.close()
+    app.processEvents()
+
+
+def test_live_partial_does_not_show_previous_sentence_translation_as_current(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    page = LivePage(
+        Bridge(), lambda *_: None, lambda *_: None, lambda: None,
+        CourseRepository(tmp_path / "partial.db"),
+    )
+    previous = Segment("Previous sentence.", "", 0, 1000)
+    page.handle_event("segment_original", previous)
+    page.handle_event("partial", ("local-current", "Next sentence in progress"))
+    page.handle_event("translation_delta", (previous.id, "上一句的部分译文"))
+
+    assert page.partial.text() == "Next sentence in progress"
+    assert "等待完整英文句子" in page.current_translation.text()
+    assert "正在翻译" in page.transcript_cards[previous.id].chinese.text()
+    assert previous.translated_text == ""
+    page._render_paragraph_window(0)
+    assert "上一句的部分译文" in page.transcript_cards[previous.id].chinese.text()
+    assert "正在翻译" in page.transcript_cards[previous.id].chinese.text()
+    previous.translated_text = "上一句完整译文"
+    page.handle_event("segment_update", previous)
+    assert "等待完整英文句子" in page.current_translation.text()
+
+    current = Segment("Next sentence.", "", 1100, 2100)
+    page.handle_event("segment_original", current)
+    page.handle_event("translation_delta", (current.id, "下一句部分译文"))
+    assert page.current_translation.text() == "下一句部分译文"
+    page.close()
+    app.processEvents()
+
+
+def test_deferred_and_failed_translation_have_distinct_live_states(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    page = LivePage(
+        Bridge(), lambda *_: None, lambda *_: None, lambda: None,
+        CourseRepository(tmp_path / "translation-state.db"),
+    )
+    segment = Segment("Fast lecture.", "", 0, 1000)
+    page.handle_event("segment_original", segment)
+    page.handle_event("translation_failed", (segment.id, "翻译队列已满，空档自动补译"))
+    assert segment.id in page.deferred_segment_ids
+    assert segment.id not in page.failed_segment_ids
+    assert "等空档自动补译" in page.transcript_cards[segment.id].chinese.text()
+    assert page.transcript_cards[segment.id].retry_button.isHidden()
+    page._render_paragraph_window(0)
+    assert "等空档自动补译" in page.transcript_cards[segment.id].chinese.text()
+    page.handle_event("metrics", {"translation_queue": 1, "translation_deferred": 1,
+                                  "translation_active": 0, "last_translation_ms": 0})
+    assert "等空档补 1 句" in page.translation_quality.text()
+
+    page.handle_event("segment_retrying", segment.id)
+    assert segment.id not in page.deferred_segment_ids
+    page.handle_event("translation_failed", (segment.id, "网络请求失败"))
+    page.handle_event("metrics", {"translation_queue": 0, "translation_deferred": 0,
+                                  "translation_active": 0, "last_translation_ms": 100})
+    assert segment.id in page.failed_segment_ids
+    assert "待手动补 1 句" in page.translation_quality.text()
+    assert not page.transcript_cards[segment.id].retry_button.isHidden()
+    page.close()
+    app.processEvents()
+
+
 def test_close_request_waits_for_session_cleanup(monkeypatch, tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     monkeypatch.setenv("CLASSNOTE_DB", str(tmp_path / "close-live.db"))

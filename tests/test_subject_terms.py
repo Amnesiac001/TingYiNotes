@@ -137,6 +137,7 @@ def test_recovery_passes_subject_terms_to_translation(
     course = CourseResult("课", "网络", "mic", [], "")
     repository.create_course(course)
     repository.add_segment(course.id, Segment("RTT", "", 0, 1000), 0, "retry")
+    repository.set_course_state(course.id, "interrupted")
 
     class Processor:
         def translate(self, text, subject, terms):

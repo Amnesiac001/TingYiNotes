@@ -50,10 +50,34 @@ def test_hidden_sentence_details_are_not_rebuilt_for_every_stream_delta() -> Non
 
     card.update_translation(second.id, "流式片段", final=False)
 
-    assert card.chinese.text() == "第一句。 流式片段"
+    assert card.chinese.text() == "第一句。 流式片段  正在翻译……"
+    assert second.translated_text == ""  # Preview must not become a saved translation.
     assert card.details.text() == before
     card.toggle_details()
     assert "流式片段" in card.details.text()
+    assert "正在翻译" in card.details.text()
+    card.update_translation(second.id, "第二句。")
+    assert card.chinese.text() == "第一句。 第二句。"
+    assert second.translated_text == "第二句。"
+    card.close()
+    card.deleteLater()
+    app.processEvents()
+
+
+def test_deferred_translation_is_not_shown_as_a_manual_failure() -> None:
+    app = QApplication.instance() or QApplication([])
+    segment = Segment("Fast lecture.", "", 0, 1000)
+    card = ParagraphCard(segment)
+
+    card.update_translation(segment.id, "", deferred=True)
+    assert "等空档自动补译" in card.chinese.text()
+    assert "翻译失败" not in card.chinese.text()
+    assert card.retry_button.isHidden()
+    card.toggle_details()
+    assert "等空档自动补译" in card.details.text()
+
+    card.set_retrying(segment.id)
+    assert "正在翻译" in card.chinese.text()
     card.close()
     card.deleteLater()
     app.processEvents()

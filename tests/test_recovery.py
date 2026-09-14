@@ -17,6 +17,19 @@ class RecoveryProcessor:
         return f"# {title}\n\n{translation}"
 
 
+def test_recovery_refuses_a_course_that_is_still_active(tmp_path: Path) -> None:
+    repository = CourseRepository(tmp_path / "active-recovery.db")
+    course = CourseResult("正在上课", "网络", "local:mic", [], "")
+    repository.create_course(course)
+    repository.add_segment(course.id, Segment("Live English", "", 0, 1000), 0, "pending")
+
+    with pytest.raises(RuntimeError, match="课堂仍在录音或处理"):
+        recover_course(course.id, repository, text_processor=RecoveryProcessor())
+
+    assert repository.get_course(course.id)["status"] == "recording"
+    assert repository.pending_segments(course.id)[0]["translation_status"] == "pending"
+
+
 def test_recover_course_translates_pending_rebuilds_notes_and_exports(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -147,6 +160,7 @@ def test_recovery_pauses_after_two_consecutive_translation_failures(
             course.id, Segment(f"Sentence {index}", "", index * 1000, (index + 1) * 1000),
             index, "retry",
         )
+    repository.set_course_state(course.id, "interrupted")
 
     class FailingProcessor(RecoveryProcessor):
         def __init__(self) -> None:
@@ -193,6 +207,7 @@ def test_recovery_continues_after_one_isolated_translation_failure(
             course.id, Segment(f"Sentence {index}", "", index * 1000, (index + 1) * 1000),
             index, "retry",
         )
+    repository.set_course_state(course.id, "interrupted")
 
     class IntermittentProcessor(RecoveryProcessor):
         def __init__(self) -> None:

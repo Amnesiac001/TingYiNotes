@@ -154,6 +154,41 @@ def warmup_local_model(model: object) -> None:
     list(segments)
 
 
+def transcribe_local_audio(model: object, audio: np.ndarray, hotwords: str | None = None) -> str:
+    """Use the same low-latency inference options for live class and benchmarks."""
+    segments, _ = model.transcribe(  # type: ignore[attr-defined]
+        audio,
+        language="en",
+        task="transcribe",
+        beam_size=1,
+        best_of=1,
+        temperature=0.0,
+        word_timestamps=False,
+        vad_filter=False,
+        condition_on_previous_text=False,
+        hotwords=hotwords or None,
+    )
+    return " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+
+
+def _backlog_level(queued_ms: int, previous: int) -> int:
+    """Use hysteresis so a queue near a warning threshold does not flicker."""
+    if queued_ms >= 5000 or (previous == 2 and queued_ms > 4000):
+        return 2
+    if queued_ms >= 1500 or (previous >= 1 and queued_ms > 1000):
+        return 1
+    return 0
+
+
+def _partial_refresh_seconds(base_seconds: float, queued_ms: int) -> float:
+    """Spend less ASR time revising a live preview when captured audio is waiting."""
+    if queued_ms >= 5000:
+        return max(base_seconds, min(2.4, base_seconds * 3))
+    if queued_ms >= 1500:
+        return max(base_seconds, min(1.6, base_seconds * 2))
+    return base_seconds
+
+
 def common_prefix(left: str, right: str) -> str:
     """Return the word prefix shared by consecutive live hypotheses."""
     first = left.split()
@@ -173,6 +208,7 @@ class LocalLiveCourseSession:
     SOFT_ENDPOINT_SILENCE_MS = 320
     MAX_UTTERANCE_SECONDS = 10
     AUDIO_BLOCK_MS = 30
+    VAD_STEP_MS = 120
     MAX_AUDIO_BUFFER_SECONDS = 300
 
     def __init__(
@@ -484,11 +520,16 @@ class LocalLiveCourseSession:
         previous_hypothesis = ""
         utterance_start_ms: int | None = None
         last_inference = 0.0
+        bytes_since_vad = 0
+        vad_step_bytes = int(self.SAMPLE_RATE * 2 * self.VAD_STEP_MS / 1000)
+        last_backlog_level = 0
+        last_backlog_report = 0.0
         refresh_seconds = self.settings.local_refresh_ms / 1000
+        pending_block: tuple[bytes, int] | None = None
 
         while True:
             stopping = self.stop_event.is_set()
-            final_pass = stopping and self.audio_queue.empty()
+            final_pass = stopping and self.audio_queue.empty() and pending_block is None
             # Stop must drain buffered opening audio even if the user paused
             # before the local model finished loading.
             # Drain audio captured just before Pause as one utterance, then
@@ -497,43 +538,64 @@ class LocalLiveCourseSession:
                 self.pause_event.is_set()
                 and not stopping
                 and self.audio_queue.empty()
+                and pending_block is None
             )
             if pause_flush and not buffer:
                 time.sleep(0.08)
                 continue
+            appended_bytes = 0
+            gap_flush = False
             try:
-                data, captured_end_ms = self.audio_queue.get(
-                    timeout=0.0 if final_pass else 0.1
-                )
+                if pending_block is not None:
+                    data, captured_end_ms = pending_block
+                    pending_block = None
+                else:
+                    data, captured_end_ms = self.audio_queue.get(
+                        timeout=0.0 if final_pass else 0.1
+                    )
                 data_duration_ms = int(
                     len(data) / (2 * self.SAMPLE_RATE) * 1000
                 )
                 data_start_ms = max(0, captured_end_ms - data_duration_ms)
                 if buffer_start_ms is None:
                     buffer_start_ms = data_start_ms
-                elif data_start_ms > buffer_end_ms + self.AUDIO_BLOCK_MS:
-                    # Preserve an intentional pause that happened while the model
-                    # was loading. Silence makes VAD close the earlier sentence and
-                    # keeps delayed transcript timestamps aligned to wall time.
-                    gap_ms = min(
-                        data_start_ms - buffer_end_ms,
-                        self.MAX_AUDIO_BUFFER_SECONDS * 1000,
-                    )
-                    buffer.extend(
-                        bytes(int(self.SAMPLE_RATE * gap_ms / 1000) * 2)
-                    )
-                buffer.extend(data)
-                buffer_end_ms = captured_end_ms
+                elif data_start_ms > buffer_end_ms + 3 * self.AUDIO_BLOCK_MS:
+                    # A pause or capture interruption is a real timeline boundary,
+                    # not hundreds of seconds of silence to feed into Whisper.
+                    pending_block = (data, captured_end_ms)
+                    gap_flush = True
+                if not gap_flush:
+                    buffer.extend(data)
+                    appended_bytes += len(data)
+                    buffer_end_ms = captured_end_ms
             except queue.Empty:
                 data = b""
+            queued_ms = (self.audio_queue.qsize() + (pending_block is not None)) * self.AUDIO_BLOCK_MS
+            backlog_level = _backlog_level(queued_ms, last_backlog_level)
+            report_now = time.monotonic()
+            if backlog_level and (
+                backlog_level != last_backlog_level
+                or report_now - last_backlog_report >= 1.0
+            ):
+                self.event("asr_backlog", {"queued_ms": queued_ms, "backlog_level": backlog_level})
+                last_backlog_level = backlog_level
+                last_backlog_report = report_now
+            elif not backlog_level and last_backlog_level:
+                self.event("asr_backlog", {"queued_ms": queued_ms, "backlog_level": 0})
+                last_backlog_level = 0
+                last_backlog_report = report_now
             if not buffer:
                 if final_pass:
                     break
                 continue
+            bytes_since_vad += appended_bytes
+            if bytes_since_vad < vad_step_bytes and not (final_pass or pause_flush or gap_flush):
+                continue
+            bytes_since_vad = 0
             audio = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
             speech = vad_function(audio, vad_options)
             if not speech:
-                if pause_flush:
+                if pause_flush or gap_flush:
                     buffer.clear()
                     buffer_start_ms = None
                 elif len(audio) > self.SAMPLE_RATE * 2:
@@ -548,7 +610,11 @@ class LocalLiveCourseSession:
             silence_ms = int((len(audio) - speech[-1]["end"]) / self.SAMPLE_RATE * 1000)
             duration_seconds = len(audio) / self.SAMPLE_RATE
             now = time.monotonic()
-            due = now - last_inference >= refresh_seconds and duration_seconds >= 0.75
+            partial_refresh = (
+                refresh_seconds if not last_inference
+                else _partial_refresh_seconds(refresh_seconds, queued_ms)
+            )
+            due = now - last_inference >= partial_refresh and duration_seconds >= 0.75
             endpoint = silence_ms >= self.ENDPOINT_SILENCE_MS
             if (
                 hypothesis.rstrip().endswith((".", "?", "!"))
@@ -556,7 +622,7 @@ class LocalLiveCourseSession:
             ):
                 endpoint = True
             forced = duration_seconds >= self.MAX_UTTERANCE_SECONDS
-            if due or endpoint or forced or final_pass or pause_flush:
+            if due or endpoint or forced or final_pass or pause_flush or gap_flush:
                 inference_started = time.monotonic()
                 hypothesis = self._transcribe(model, audio)
                 inference_ms = int((time.monotonic() - inference_started) * 1000)
@@ -565,6 +631,7 @@ class LocalLiveCourseSession:
                 previous_hypothesis = hypothesis
                 if hypothesis:
                     self.event("partial", ("local-current", hypothesis))
+                    inference_queued_ms = (self.audio_queue.qsize() + (pending_block is not None)) * self.AUDIO_BLOCK_MS
                     self.event(
                         "asr_metrics",
                         {
@@ -572,9 +639,11 @@ class LocalLiveCourseSession:
                             "audio_ms": int(duration_seconds * 1000),
                             "stable_words": len(stable.split()),
                             "dropped_ms": self.dropped_blocks * self.AUDIO_BLOCK_MS,
+                            "queued_ms": inference_queued_ms,
+                            "backlog_level": _backlog_level(inference_queued_ms, last_backlog_level),
                         },
                     )
-            if hypothesis and (endpoint or forced or final_pass or pause_flush):
+            if hypothesis and (endpoint or forced or final_pass or pause_flush or gap_flush):
                 start_ms = (
                     utterance_start_ms
                     if utterance_start_ms is not None
@@ -591,7 +660,7 @@ class LocalLiveCourseSession:
                 # 10-second split can end on speech; carrying it forward duplicated words.
                 trailing_samples = (
                     min(int(self.SAMPLE_RATE * 0.2), len(audio))
-                    if endpoint and not forced and not pause_flush
+                    if endpoint and not forced and not (pause_flush or gap_flush)
                     else 0
                 )
                 buffer = bytearray(
@@ -607,7 +676,7 @@ class LocalLiveCourseSession:
                 hypothesis = ""
                 previous_hypothesis = ""
                 utterance_start_ms = None
-            elif pause_flush:
+            elif pause_flush or gap_flush:
                 # Do not keep retrying an untranscribable paused fragment.
                 buffer.clear()
                 buffer_start_ms = None
@@ -618,21 +687,7 @@ class LocalLiveCourseSession:
                 break
 
     def _transcribe(self, model: object, audio: np.ndarray) -> str:
-        segments, _ = model.transcribe(  # type: ignore[attr-defined]
-            audio,
-            language="en",
-            task="transcribe",
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            # Endpointing already runs Silero VAD above, and live rendering does not
-            # consume word timestamps. Avoid doing both pieces of work twice.
-            word_timestamps=False,
-            vad_filter=False,
-            condition_on_previous_text=False,
-            hotwords=self.course_context.hotword_prompt or None,
-        )
-        return " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+        return transcribe_local_audio(model, audio, self.course_context.hotword_prompt)
 
     def _finalize(self) -> None:
         if self.finalized:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tingyiji-notes"
-version = "0.2.0"
+version = "0.2.1"
 description = "听译记：英文课堂实时转写、翻译与结构化笔记"
 readme = "README.md"
 requires-python = ">=3.11"

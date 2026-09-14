@@ -145,6 +145,74 @@ def test_full_translation_queue_cannot_block_bounded_class_shutdown(tmp_path: Pa
     assert rows[second.id]["translation_status"] == "retry"
 
 
+def test_translation_arriving_after_shutdown_deadline_cannot_change_exported_result(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    events: list[tuple[str, object]] = []
+
+    class SlowProcessor:
+        def translate(self, text: str, subject: str, terms: dict[str, str]) -> str:
+            entered.set()
+            release.wait(timeout=3)
+            return "迟到的译文"
+
+    repository = CourseRepository(tmp_path / "late-result.db")
+    result = CourseResult("长课收尾", "测试", "local:mic", [], "")
+    repository.create_course(result)
+    coordinator = LiveTranslationCoordinator(
+        result, repository, SlowProcessor(), "测试",
+        lambda name, payload: events.append((name, payload)), workers=1,
+    )
+    coordinator.start()
+    segment = coordinator.submit("Keep the English", 0, 1000)
+    assert entered.wait(timeout=1)
+    assert not coordinator.close_and_wait(timeout=0.05)
+    row = repository.get_course_segments(result.id)[0]
+    assert row["translation_status"] == "retry"
+    assert "课程库" in row["translation_error"]
+
+    release.set()
+    coordinator.threads[0].join(timeout=2)
+    assert not coordinator.threads[0].is_alive()
+    row = repository.get_course_segments(result.id)[0]
+    assert row["translation_status"] == "retry"
+    assert row["translated_text"] == ""
+    assert segment.translated_text == ""
+    assert not any(name == "segment_update" for name, _ in events)
+
+
+def test_streaming_translation_stops_emitting_after_shutdown_deadline(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    events: list[tuple[str, object]] = []
+
+    class SlowStreamProcessor:
+        def translate_stream(self, text: str, subject: str, terms: dict[str, str]):
+            yield "临时片段"
+            entered.set()
+            release.wait(timeout=3)
+            yield "迟到片段"
+
+    repository = CourseRepository(tmp_path / "late-stream.db")
+    result = CourseResult("流式收尾", "测试", "local:mic", [], "")
+    repository.create_course(result)
+    coordinator = LiveTranslationCoordinator(
+        result, repository, SlowStreamProcessor(), "测试",
+        lambda name, payload: events.append((name, payload)), workers=1,
+    )
+    coordinator.start()
+    segment = coordinator.submit("English remains safe", 0, 1000)
+    assert entered.wait(timeout=1)
+    assert not coordinator.close_and_wait(timeout=0.05)
+    before_release = len([1 for name, _ in events if name == "translation_delta"])
+    release.set()
+    coordinator.threads[0].join(timeout=2)
+
+    assert len([1 for name, _ in events if name == "translation_delta"]) == before_release
+    assert segment.translated_text == ""
+    assert repository.get_course_segments(result.id)[0]["translation_status"] == "retry"
+
+
 def test_budget_paused_sentence_is_saved_without_entering_queue(tmp_path: Path) -> None:
     class PausedProcessor:
         budget_guard = staticmethod(lambda phase: False)
@@ -198,6 +266,13 @@ def test_queue_overflow_marks_each_sentence_but_throttles_warning(tmp_path: Path
     assert rows[overflow_b.id]["translation_status"] == "retry"
     release.set()
     coordinator.close_and_wait(timeout=5)
+    assert coordinator._deferred_ids == set()
+    assert any(
+        name == "translation_failed" and payload[0] == overflow_a.id
+        and "课程库" in payload[1]
+        for name, payload in events
+    )
+    assert [payload for name, payload in events if name == "metrics"][-1]["translation_deferred"] == 0
 
 
 def test_queue_overflow_is_automatically_translated_after_short_pause(tmp_path: Path) -> None:

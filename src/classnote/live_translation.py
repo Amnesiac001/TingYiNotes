@@ -70,6 +70,7 @@ class LiveTranslationCoordinator:
         self._deferred_ids: set[str] = set()
         self._catchup_active = False
         self._last_submit_at = time.monotonic()
+        self._abandon_late_results = False
 
     def start(self) -> None:
         for index in range(self.workers):
@@ -144,26 +145,39 @@ class LiveTranslationCoordinator:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         alive = [thread for thread in self.threads if thread.is_alive()]
         if alive:
+            # A request still running after the shutdown deadline must not update
+            # the in-memory result or database after notes have been exported.
+            with self._lock:
+                self._abandon_late_results = True
             # The normal path drains all submitted work. If the deadline is reached,
             # preserve anything not yet started as explicit retry work rather than
             # silently exporting an incomplete translation as finished.
             while True:
                 try:
-                    queued = self.queue.get_nowait()
+                    self.queue.get_nowait()
                 except queue.Empty:
                     break
-                if queued is not None:
-                    self.repository.set_translation_state(
-                        queued.segment.id,
-                        "retry",
-                        error="课堂结束时尚未翻译，可在课程库中补译。",
-                    )
                 self.queue.task_done()
             for _ in alive:
                 try:
                     self.queue.put_nowait(None)
                 except queue.Full:
                     break
+            for row in self.repository.pending_segments(self.result.id):
+                if row["translation_status"] in {"pending", "translating"}:
+                    self.repository.set_translation_state(
+                        str(row["id"]), "retry",
+                        error="课堂结束时翻译尚未返回，可在课程库中补译。",
+                    )
+        with self._lock:
+            deferred_ids = list(self._deferred_ids)
+            self._deferred.clear()
+            self._deferred_ids.clear()
+        for segment_id in deferred_ids:
+            self.event(
+                "translation_failed",
+                (segment_id, "课堂已结束，自动补译未完成；请在课程库中补译。"),
+            )
         # Publish the final shutdown snapshot (normally zero; timed-out workers may
         # still have only their termination sentinels queued).
         self._emit_metrics()
@@ -262,14 +276,19 @@ class LiveTranslationCoordinator:
 
     def _translate(self, job: TranslationJob) -> None:
         segment = job.segment
-        self.repository.set_translation_state(segment.id, "translating")
+        with self._lock:
+            if self._abandon_late_results:
+                return
+            self.repository.set_translation_state(segment.id, "translating")
         try:
             translated = self._stream_or_translate(segment)
             if not translated:
                 raise RuntimeError("翻译服务没有返回内容。")
-            segment.translated_text = translated
-            self.repository.set_translation_state(segment.id, "completed", translated)
             with self._lock:
+                if self._abandon_late_results:
+                    return
+                segment.translated_text = translated
+                self.repository.set_translation_state(segment.id, "completed", translated)
                 self._retrying_ids.discard(segment.id)
             self.event("segment_update", segment)
             if self.on_translated is not None:
@@ -282,14 +301,21 @@ class LiveTranslationCoordinator:
                 values = "、".join(sorted(missing)[:5])
                 self.event("warning", f"已保留英文原文；请留意本句中的数字或缩写：{values}")
         except BudgetLimitReached as exc:
-            self.repository.set_translation_state(segment.id, "retry", error=str(exc))
             with self._lock:
+                if self._abandon_late_results:
+                    return
+                self.repository.set_translation_state(segment.id, "retry", error=str(exc))
                 self._retrying_ids.discard(segment.id)
             self.event("translation_failed", (segment.id, str(exc)))
         except Exception as exc:
+            with self._lock:
+                if self._abandon_late_results:
+                    return
             if job.attempt < 1 and not self._closed:
                 self.repository.set_translation_state(segment.id, "retry", error=str(exc))
                 time.sleep(0.4)
+                if self._closed:
+                    return
                 try:
                     self.queue.put_nowait(
                         TranslationJob(segment, job.attempt + 1, time.monotonic())
@@ -297,8 +323,10 @@ class LiveTranslationCoordinator:
                     return
                 except queue.Full:
                     pass
-            self.repository.set_translation_state(segment.id, "failed", error=str(exc))
             with self._lock:
+                if self._abandon_late_results:
+                    return
+                self.repository.set_translation_state(segment.id, "failed", error=str(exc))
                 self._retrying_ids.discard(segment.id)
             self.event("translation_failed", (segment.id, str(exc)))
             self.event("warning", f"一句中文翻译失败，英文已保存：{exc}")
@@ -316,15 +344,23 @@ class LiveTranslationCoordinator:
             segment.original_text, self.subject,
             relevant_terms(segment.original_text, self.terms),
         ):
+            with self._lock:
+                if self._abandon_late_results:
+                    return ""
             parts.append(str(delta))
             now = time.monotonic()
             if now - last_emit >= 0.05:
-                self.event("translation_delta", (segment.id, "".join(parts)))
+                self._emit_translation_delta(segment.id, "".join(parts))
                 last_emit = now
         translated = "".join(parts).strip()
         if translated:
-            self.event("translation_delta", (segment.id, translated))
+            self._emit_translation_delta(segment.id, translated)
         return translated
+
+    def _emit_translation_delta(self, segment_id: str, text: str) -> None:
+        with self._lock:
+            if not self._abandon_late_results:
+                self.event("translation_delta", (segment_id, text))
 
     def _emit_metrics(self) -> None:
         with self._lock:

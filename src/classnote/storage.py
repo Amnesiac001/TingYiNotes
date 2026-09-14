@@ -714,3 +714,13 @@ class CourseRepository:
         with self.connect() as connection:
             cursor = connection.execute("DELETE FROM courses WHERE id = ?", (course_id,))
             return cursor.rowcount > 0
+
+    def delete_course_if_inactive(self, course_id: str) -> bool:
+        """Atomically refuse user deletion while a class is still processing."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """DELETE FROM courses WHERE id = ?
+                   AND status NOT IN ('recording', 'transcribing', 'translating', 'organizing')""",
+                (course_id,),
+            )
+            return cursor.rowcount > 0

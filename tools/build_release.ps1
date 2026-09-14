@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)))
 $releaseRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot "release"))
-$packageName = "TingYiNotes-0.2.0-macOS-build"
+$packageName = "TingYiNotes-0.2.1-macOS-build"
 $target = [IO.Path]::GetFullPath((Join-Path $releaseRoot $packageName))
 $archive = [IO.Path]::GetFullPath((Join-Path $releaseRoot ($packageName + ".zip")))
 $releasePrefix = $releaseRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar

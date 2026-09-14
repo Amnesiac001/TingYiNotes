@@ -28,6 +28,8 @@ def recover_course(
     row = repository.get_course(course_id)
     if row is None:
         raise RuntimeError("课程记录不存在，可能已经被删除。")
+    if str(row["status"]) in {"recording", "transcribing", "translating", "organizing"}:
+        raise RuntimeError("课堂仍在录音或处理，请结束并等待收尾完成后再补译。")
     saved = repository.get_course_segments(course_id)
     if not saved:
         raise RuntimeError("这条课程没有可恢复的英文字幕。请重新开始课堂或导入原录音。")

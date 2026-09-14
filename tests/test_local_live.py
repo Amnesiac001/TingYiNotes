@@ -248,6 +248,222 @@ def test_buffered_opening_audio_keeps_its_original_timestamp() -> None:
     assert submitted == [("Opening sentence.", 0, 1000)]
 
 
+def test_long_pause_splits_audio_without_allocating_silent_minutes() -> None:
+    submitted: list[tuple[str, int, int]] = []
+    inference_lengths: list[int] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.started_monotonic = local_live.time.monotonic() - 310
+    session.audio_queue = queue.Queue()
+    session.audio_queue.put((bytes(16000 * 2), 1000))
+    session.audio_queue.put((bytes(16000 * 2), 301000))
+    session.stop_event = threading.Event()
+    session.stop_event.set()
+    session.pause_event = threading.Event()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda *args: None
+    session.translations = SimpleNamespace(
+        submit=lambda text, start, end: submitted.append((text, start, end))
+    )
+
+    def transcribe(model, audio):
+        inference_lengths.append(len(audio))
+        return "Lecture sentence."
+
+    session._transcribe = transcribe
+    speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
+
+    session._recognition_loop(object(), speech, object())
+
+    assert max(inference_lengths) == 16000
+    assert submitted == [
+        ("Lecture sentence.", 0, 1000),
+        ("Lecture sentence.", 300000, 301000),
+    ]
+
+
+def test_pause_flush_processes_pending_audio_after_a_gap() -> None:
+    submitted: list[tuple[str, int, int]] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.started_monotonic = local_live.time.monotonic() - 20
+    session.audio_queue = queue.Queue()
+    session.audio_queue.put((bytes(16000 * 2), 1000))
+    session.audio_queue.put((bytes(16000 * 2), 5000))
+    session.stop_event = threading.Event()
+    session.pause_event = threading.Event()
+    session.pause_event.set()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda *args: None
+
+    def submit(text, start, end):
+        submitted.append((text, start, end))
+        if len(submitted) == 2:
+            session.stop_event.set()
+
+    session.translations = SimpleNamespace(submit=submit)
+    session._transcribe = lambda model, audio: "Lecture sentence."
+    speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
+    worker = threading.Thread(
+        target=session._recognition_loop, args=(object(), speech, object()), daemon=True
+    )
+    worker.start()
+    worker.join(timeout=2)
+    if worker.is_alive():
+        session.stop_event.set()
+        session.pause_event.clear()
+        worker.join(timeout=1)
+
+    assert not worker.is_alive(), "暂停后的待处理片段不能卡住结束流程"
+    assert submitted == [
+        ("Lecture sentence.", 0, 1000),
+        ("Lecture sentence.", 4000, 5000),
+    ]
+
+
+def test_vad_checks_new_audio_in_steps_instead_of_every_block() -> None:
+    checks: list[int] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.audio_queue = queue.Queue()
+    for block in range(40):
+        session.audio_queue.put((bytes(960), (block + 1) * 30))
+    session.stop_event = threading.Event()
+    session.stop_event.set()
+    session.pause_event = threading.Event()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda *args: None
+
+    def no_speech(audio, options):
+        checks.append(len(audio))
+        return []
+
+    session._recognition_loop(object(), no_speech, object())
+
+    assert len(checks) <= 12  # 1.2 s / 120 ms, plus the final forced check.
+    assert checks[-1] == 40 * 480
+
+
+def test_backlog_warning_has_margin_before_downgrading() -> None:
+    assert local_live._backlog_level(5000, 0) == 2
+    assert local_live._backlog_level(4970, 2) == 2
+    assert local_live._backlog_level(4000, 2) == 1
+    assert local_live._backlog_level(1400, 1) == 1
+    assert local_live._backlog_level(1000, 1) == 0
+
+
+def test_partial_preview_refresh_backs_off_only_when_audio_is_queued() -> None:
+    base = 0.8
+    assert local_live._partial_refresh_seconds(base, 0) == base
+    assert local_live._partial_refresh_seconds(base, 1499) == base
+    assert local_live._partial_refresh_seconds(base, 1500) == 1.6
+    assert local_live._partial_refresh_seconds(base, 5000) == 2.4
+    assert local_live._partial_refresh_seconds(3.0, 5000) == 3.0
+
+
+def test_backed_up_fast_speech_is_still_saved_on_final_pass() -> None:
+    submitted: list[tuple[str, int, int]] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.started_monotonic = local_live.time.monotonic()
+    session.audio_queue = queue.Queue()
+    for block in range(200):
+        session.audio_queue.put((bytes(960), (block + 1) * 30))
+    session.stop_event = threading.Event()
+    session.stop_event.set()
+    session.pause_event = threading.Event()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda *args: None
+    session.translations = SimpleNamespace(
+        submit=lambda text, start, end: submitted.append((text, start, end))
+    )
+    session._transcribe = lambda model, audio: "Fast lecture."
+    speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
+
+    session._recognition_loop(object(), speech, object())
+
+    assert submitted == [("Fast lecture.", 0, 6000)]
+
+
+def test_vad_final_pass_keeps_a_short_last_fragment() -> None:
+    submitted: list[tuple[str, int, int]] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.started_monotonic = local_live.time.monotonic()
+    session.audio_queue = queue.Queue()
+    session.audio_queue.put((bytes(960), 30))
+    session.stop_event = threading.Event()
+    session.stop_event.set()
+    session.pause_event = threading.Event()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda *args: None
+    session.translations = SimpleNamespace(
+        submit=lambda text, start, end: submitted.append((text, start, end))
+    )
+    session._transcribe = lambda model, audio: "Last word."
+    speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
+
+    session._recognition_loop(object(), speech, object())
+
+    assert submitted == [("Last word.", 0, 30)]
+
+
+def test_asr_metrics_include_audio_waiting_behind_inference() -> None:
+    events: list[tuple[str, object]] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.started_monotonic = local_live.time.monotonic()
+    session.audio_queue = queue.Queue()
+    session.audio_queue.put((bytes(16000 * 2), 1000))
+    session.stop_event = threading.Event()
+    session.stop_event.set()
+    session.pause_event = threading.Event()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda name, payload: events.append((name, payload))
+    session.translations = SimpleNamespace(submit=lambda *args: None)
+    first_inference = True
+
+    def transcribe(model, audio):
+        nonlocal first_inference
+        if first_inference:
+            first_inference = False
+            for block in range(6):
+                session.audio_queue.put((bytes(960), 1030 + block * 30))
+        return "Lecture sentence."
+
+    session._transcribe = transcribe
+    speech = lambda audio, options: [{"start": 0, "end": len(audio)}]
+
+    session._recognition_loop(object(), speech, object())
+
+    metrics = [payload for name, payload in events if name == "asr_metrics"]
+    assert metrics[0]["queued_ms"] == 180
+
+
+def test_backlog_status_updates_without_any_recognized_words() -> None:
+    events: list[tuple[str, object]] = []
+    session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)
+    session.audio_queue = queue.Queue()
+    for block in range(200):
+        session.audio_queue.put((bytes(960), (block + 1) * 30))
+    session.stop_event = threading.Event()
+    session.stop_event.set()
+    session.pause_event = threading.Event()
+    session.settings = SimpleNamespace(local_refresh_ms=800)
+    session.dropped_blocks = 0
+    session.event = lambda name, payload: events.append((name, payload))
+
+    session._recognition_loop(object(), lambda audio, options: [], object())
+
+    backlog = [payload for name, payload in events if name == "asr_backlog"]
+    assert backlog[0]["queued_ms"] >= 5000
+    assert backlog[0]["backlog_level"] == 2
+    assert backlog[-1]["queued_ms"] <= 1000
+    assert backlog[-1]["backlog_level"] == 0
+    assert len(backlog) <= 5
+    assert not any(name == "asr_metrics" for name, _ in events)
+
+
 def test_stop_drains_buffered_audio_even_when_model_loaded_during_pause() -> None:
     submitted: list[tuple[str, int, int]] = []
     session = LocalLiveCourseSession.__new__(LocalLiveCourseSession)

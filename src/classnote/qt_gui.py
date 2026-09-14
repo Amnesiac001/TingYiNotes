@@ -536,6 +536,9 @@ class ParagraphCard(QFrame):
         super().__init__()
         self.segments: list[Segment] = [segment]
         self.failed_ids: set[str] = set()
+        self.deferred_ids: set[str] = set()
+        self.streaming_ids: set[str] = set()
+        self.streaming_text: dict[str, str] = {}
         self.reading_mode = "chinese"
         self.setObjectName("Transcript")
         self.review_highlight_timer = QTimer(self)
@@ -653,17 +656,38 @@ class ParagraphCard(QFrame):
         self.render()
 
     def update_translation(
-        self, segment_id: str, text: str, failed: bool = False, final: bool = True
+        self, segment_id: str, text: str, failed: bool = False,
+        final: bool = True, deferred: bool = False,
     ) -> None:
-        for segment in self.segments:
-            if segment.id == segment_id:
-                segment.translated_text = text
-                break
+        if not final and not (failed or deferred):
+            self.streaming_text[segment_id] = text
+        else:
+            self.streaming_text.pop(segment_id, None)
+            for segment in self.segments:
+                if segment.id == segment_id:
+                    segment.translated_text = text
+                    break
         if failed:
             self.failed_ids.add(segment_id)
-        elif text:
+            self.deferred_ids.discard(segment_id)
+            self.streaming_ids.discard(segment_id)
+        elif deferred:
+            self.deferred_ids.add(segment_id)
             self.failed_ids.discard(segment_id)
+            self.streaming_ids.discard(segment_id)
+        elif not final:
+            self.streaming_ids.add(segment_id)
+            self.deferred_ids.discard(segment_id)
+            self.failed_ids.discard(segment_id)
+        else:
+            self.streaming_ids.discard(segment_id)
+            self.deferred_ids.discard(segment_id)
+            if text:
+                self.failed_ids.discard(segment_id)
         self.render(update_details=final)
+
+    def _display_translation(self, segment: Segment) -> str:
+        return self.streaming_text.get(segment.id, segment.translated_text).strip()
 
     def render(self, update_details: bool = True) -> None:
         last = self.segments[-1]
@@ -683,12 +707,25 @@ class ParagraphCard(QFrame):
         self.question_action.setText("取消段末疑问" if tail_marker == "question" else "段末标为疑问")
         self.clear_marker_action.setEnabled(bool(tail_marker))
         self.english.setText(" ".join(item.original_text.strip() for item in self.segments))
-        translated = [item.translated_text.strip() for item in self.segments if item.translated_text.strip()]
-        waiting = any(not item.translated_text.strip() and item.id not in self.failed_ids for item in self.segments)
+        translated = [
+            self._display_translation(item)
+            for item in self.segments if self._display_translation(item)
+        ]
+        waiting = any(
+            item.id in self.streaming_ids or (
+                not item.translated_text.strip()
+                and item.id not in self.failed_ids
+                and item.id not in self.deferred_ids
+            )
+            for item in self.segments
+        )
         failed = any(item.id in self.failed_ids for item in self.segments)
+        deferred = sum(item.id in self.deferred_ids for item in self.segments)
         chinese = " ".join(translated)
         if waiting:
             chinese = f"{chinese}  正在翻译……".strip()
+        if deferred:
+            chinese = f"{chinese}  {deferred} 句等空档自动补译。".strip()
         if failed:
             chinese = f"{chinese}  部分句子翻译失败，英文已保存。".strip()
         self.retry_button.setVisible(failed)
@@ -700,9 +737,13 @@ class ParagraphCard(QFrame):
     def _render_details(self) -> None:
         rows = []
         for item in self.segments:
-            translation = item.translated_text.strip()
+            translation = self._display_translation(item)
             if item.id in self.failed_ids:
                 translation = "翻译失败，英文已保存"
+            elif item.id in self.deferred_ids:
+                translation = "等空档自动补译，英文已保存"
+            elif item.id in self.streaming_ids:
+                translation = f"{translation} 正在翻译……".strip()
             elif not translation:
                 translation = "正在翻译……"
             rows.append(
@@ -755,6 +796,9 @@ class ParagraphCard(QFrame):
 
     def set_retrying(self, segment_id: str) -> None:
         self.failed_ids.discard(segment_id)
+        self.deferred_ids.discard(segment_id)
+        self.streaming_ids.discard(segment_id)
+        self.streaming_text.pop(segment_id, None)
         for segment in self.segments:
             if segment.id == segment_id:
                 segment.translated_text = ""
@@ -1310,16 +1354,23 @@ class LivePage(Page):
         self.session: object | None = None
         self.cleanup_pending = False
         self.suppress_finish_dialog = False
+        self.last_asr_metrics: dict[str, int] = {
+            "inference_ms": 0, "audio_ms": 1, "queued_ms": 0,
+        }
         self.transcript_cards: dict[str, ParagraphCard] = {}
         self.paragraph_cards: list[ParagraphCard] = []
         self.paragraph_groups: list[list[Segment]] = []
         self.group_by_segment: dict[str, int] = {}
         self.segments_by_id: dict[str, Segment] = {}
         self.failed_segment_ids: set[str] = set()
+        self.deferred_segment_ids: set[str] = set()
+        self.streaming_segment_ids: set[str] = set()
+        self.streaming_translation_text: dict[str, str] = {}
         self.visible_start = 0
         self._view_dirty = False
         self.live_segments: list[Segment] = []
         self.latest_segment_id = ""
+        self.showing_live_partial = False
         self.auto_follow = True
         self.unseen_segments = 0
         self._programmatic_scroll = False
@@ -1822,7 +1873,17 @@ class LivePage(Page):
         card.failed_ids = {
             segment.id for segment in group if segment.id in self.failed_segment_ids
         }
-        if card.failed_ids:
+        card.deferred_ids = {
+            segment.id for segment in group if segment.id in self.deferred_segment_ids
+        }
+        card.streaming_ids = {
+            segment.id for segment in group if segment.id in self.streaming_segment_ids
+        }
+        card.streaming_text = {
+            segment.id: self.streaming_translation_text[segment.id]
+            for segment in group if segment.id in self.streaming_translation_text
+        }
+        if card.failed_ids or card.deferred_ids or card.streaming_ids:
             card.render()
         card.set_reading_mode(self.reading_mode)
         card.retry_requested.connect(self.retry_translation)
@@ -1999,6 +2060,7 @@ class LivePage(Page):
             self.live_status.setText(message)
 
     def begin_quality_monitoring(self, device: AudioDevice, live_mode: str) -> None:
+        self.last_asr_metrics = {"inference_ms": 0, "audio_ms": 1, "queued_ms": 0}
         self.quality_strip.show()
         self.runtime_title.setText(self.title_input.text().strip() or "英语课堂")
         self.live_status.setText("正在准备音频和识别模型")
@@ -2056,17 +2118,31 @@ class LivePage(Page):
             self._set_quality_text(self.drop_quality, f"丢帧 {dropped_ms}ms", COLORS["danger"])
 
     def update_asr_quality(self, metrics: object) -> None:
-        values = metrics  # type: ignore[assignment]
+        incoming = metrics if isinstance(metrics, dict) else {}
+        if incoming:
+            self.last_asr_metrics.update(incoming)
+        values = self.last_asr_metrics
         inference = int(values.get("inference_ms", 0))  # type: ignore[attr-defined]
         audio = max(1, int(values.get("audio_ms", 1)))  # type: ignore[attr-defined]
+        queued_ms = max(0, int(values.get("queued_ms", 0)))  # type: ignore[attr-defined]
+        raw_level = 2 if queued_ms >= 5000 else 1 if queued_ms >= 1500 else 0
+        backlog_level = int(incoming.get("backlog_level", raw_level))
         rtf = inference / audio
-        if rtf < 0.35:
+        if backlog_level >= 2:
+            state, color = f"积压 {queued_ms / 1000:.1f}s", COLORS["danger"]
+        elif backlog_level >= 1:
+            state, color = f"稍慢 · 积压 {queued_ms / 1000:.1f}s", "#9A6700"
+        elif rtf < 0.35:
             state, color = "流畅", COLORS["muted"]
         elif rtf < 0.7:
             state, color = "正常", "#9A6700"
         else:
             state, color = "正在追赶", COLORS["danger"]
-        self._set_quality_text(self.asr_quality, f"识别 {state} · {inference}ms", color)
+        if inference <= 0 and backlog_level == 0:
+            self._set_quality_text(self.asr_quality, "识别 等待英文", COLORS["muted"])
+        else:
+            duration = f" · {inference}ms" if inference > 0 else ""
+            self._set_quality_text(self.asr_quality, f"识别 {state}{duration}", color)
 
     def update_translation_quality(self, metrics: object) -> None:
         values = metrics  # type: ignore[assignment]
@@ -2075,6 +2151,7 @@ class LivePage(Page):
         fresh = max(0, queued - deferred)
         active = int(values.get("translation_active", 0))  # type: ignore[attr-defined]
         duration = int(values.get("last_translation_ms", 0))  # type: ignore[attr-defined]
+        failed = len(self.failed_segment_ids)
         if fresh >= 8:
             text, color = f"翻译 积压 {fresh} 句", COLORS["danger"]
         elif fresh >= 3:
@@ -2083,6 +2160,8 @@ class LivePage(Page):
             text, color = f"翻译 处理中{f' · {fresh}句排队' if fresh else ''}", COLORS["muted"]
         elif deferred:
             text, color = f"翻译 等空档补 {deferred} 句", "#9A6700"
+        elif failed:
+            text, color = f"翻译 待手动补 {failed} 句", COLORS["danger"]
         elif duration:
             text, color = f"翻译 实时 · {duration}ms", COLORS["muted"]
         else:
@@ -2090,6 +2169,10 @@ class LivePage(Page):
         if deferred and (fresh or active):
             text += f" · 待补{deferred}"
         self._set_quality_text(self.translation_quality, text, color)
+        self.translation_quality.setToolTip(
+            "英文已先保存；中文正在翻译或等待空档自动补译。"
+            + (f"另有 {failed} 句需在段落中重试或课后补译。" if failed else "")
+        )
 
     def start(self) -> None:
         if self.cleanup_pending:
@@ -2223,10 +2306,12 @@ class LivePage(Page):
                 self._set_quality_text(self.asr_quality, "识别 云端实时", COLORS["muted"])
         elif name == "partial":
             _, text = payload  # type: ignore[misc]
+            self.showing_live_partial = True
             self.partial.setText(str(text))
             self.current_translation.setText("正在等待完整英文句子……")
         elif name == "final_original":
             _, text, _ = payload  # type: ignore[misc]
+            self.showing_live_partial = False
             self.partial.setText(str(text))
             self.current_translation.setText("正在翻译……")
         elif name == "segment_original":
@@ -2316,14 +2401,23 @@ class LivePage(Page):
             self.add_segment(payload)  # type: ignore[arg-type]
         elif name == "translation_failed":
             segment_id, reason = payload  # type: ignore[misc]
-            self.failed_segment_ids.add(str(segment_id))
-            saved = self.segments_by_id.get(str(segment_id))
+            segment_id = str(segment_id)
+            deferred = "队列已满" in str(reason)
+            if deferred:
+                self.deferred_segment_ids.add(segment_id)
+                self.failed_segment_ids.discard(segment_id)
+            else:
+                self.failed_segment_ids.add(segment_id)
+                self.deferred_segment_ids.discard(segment_id)
+            self.streaming_segment_ids.discard(segment_id)
+            self.streaming_translation_text.pop(segment_id, None)
+            saved = self.segments_by_id.get(segment_id)
             if saved is not None:
                 saved.translated_text = ""
-            card = self.transcript_cards.get(str(segment_id))
+            card = self.transcript_cards.get(segment_id)
             if card is not None:
-                card.update_translation(str(segment_id), "", failed=True)
-            if str(segment_id) == self.latest_segment_id:
+                card.update_translation(segment_id, "", failed=not deferred, deferred=deferred)
+            if segment_id == self.latest_segment_id and not self.showing_live_partial:
                 self.current_translation.setText(
                     "预算已用完 · 英文继续保存，中文可课后补译"
                     if "预算" in str(reason) else
@@ -2334,17 +2428,22 @@ class LivePage(Page):
         elif name == "segment_retrying":
             segment_id = str(payload)
             self.failed_segment_ids.discard(segment_id)
+            self.deferred_segment_ids.discard(segment_id)
+            self.streaming_segment_ids.discard(segment_id)
+            self.streaming_translation_text.pop(segment_id, None)
             saved = self.segments_by_id.get(segment_id)
             if saved is not None:
                 saved.translated_text = ""
             card = self.transcript_cards.get(segment_id)
             if card is not None:
                 card.set_retrying(segment_id)
-            if segment_id == self.latest_segment_id:
+            if segment_id == self.latest_segment_id and not self.showing_live_partial:
                 self.current_translation.setText("正在重新翻译……")
         elif name == "metrics":
             self.update_translation_quality(payload)
         elif name == "asr_metrics":
+            self.update_asr_quality(payload)
+        elif name == "asr_backlog":
             self.update_asr_quality(payload)
         elif name == "audio_metrics":
             self.update_audio_quality(payload)
@@ -2401,6 +2500,7 @@ class LivePage(Page):
         ) < (current_latest.start_ms, current_latest.end_ms)
         if not late_arrival:
             self.latest_segment_id = segment.id
+            self.showing_live_partial = False
             self.partial.setText(segment.original_text)
             self.current_translation.setText(segment.translated_text or "正在翻译……")
             if not pending:
@@ -2525,12 +2625,15 @@ class LivePage(Page):
             return
         card = self.transcript_cards.get(segment_id)
         self.failed_segment_ids.discard(segment_id)
+        self.deferred_segment_ids.discard(segment_id)
+        self.streaming_segment_ids.discard(segment_id)
+        self.streaming_translation_text.pop(segment_id, None)
         saved = self.segments_by_id.get(segment_id)
         if saved is not None:
             saved.translated_text = ""
         if card is not None:
             card.set_retrying(segment_id)
-        if segment_id == self.latest_segment_id:
+        if segment_id == self.latest_segment_id and not self.showing_live_partial:
             self.current_translation.setText("正在重新翻译……")
         try:
             retry(segment_id)
@@ -2538,20 +2641,28 @@ class LivePage(Page):
             self.failed_segment_ids.add(segment_id)
             if card is not None:
                 card.update_translation(segment_id, "", failed=True)
-            if segment_id == self.latest_segment_id:
+            if segment_id == self.latest_segment_id and not self.showing_live_partial:
                 self.current_translation.setText("重试暂未开始 · 英文仍已安全保存")
             self.notice.show_notice(f"暂时无法重试：{friendly_error(exc)}", error=True)
 
     def update_translation(self, segment_id: str, text: str, final: bool = True) -> None:
+        if final:
+            self.streaming_segment_ids.discard(segment_id)
+            self.deferred_segment_ids.discard(segment_id)
+            self.streaming_translation_text.pop(segment_id, None)
+        else:
+            self.streaming_segment_ids.add(segment_id)
+            self.deferred_segment_ids.discard(segment_id)
+            self.streaming_translation_text[segment_id] = text
         saved = self.segments_by_id.get(segment_id)
-        if saved is not None:
+        if saved is not None and final:
             saved.translated_text = text
         if text:
             self.failed_segment_ids.discard(segment_id)
         card = self.transcript_cards.get(segment_id)
         if card is not None:
             card.update_translation(segment_id, text, final=final)
-        if text and segment_id == self.latest_segment_id:
+        if text and segment_id == self.latest_segment_id and not self.showing_live_partial:
             self.current_translation.setText(text)
         if final:
             segments = self._all_live_segments()
@@ -2626,10 +2737,14 @@ class LivePage(Page):
         self.group_by_segment.clear()
         self.segments_by_id.clear()
         self.failed_segment_ids.clear()
+        self.deferred_segment_ids.clear()
+        self.streaming_segment_ids.clear()
+        self.streaming_translation_text.clear()
         self.visible_start = 0
         self._view_dirty = False
         self.live_segments = []
         self.latest_segment_id = ""
+        self.showing_live_partial = False
         self.auto_follow = True
         self.unseen_segments = 0
         self.saved_segment_count = 0
@@ -2928,15 +3043,20 @@ class LibraryPage(Page):
 
     def selection_changed(self, index: int) -> None:
         valid = 0 <= index < len(self.rows)
-        self.delete_button.setEnabled(valid and not self._recovery_running)
+        active = valid and str(self.rows[index]["status"]) in {
+            "recording", "transcribing", "translating", "organizing"
+        }
+        self.delete_button.setEnabled(valid and not active and not self._recovery_running)
+        self.delete_button.setToolTip(
+            "课堂正在运行或收尾，请结束后再删除"
+            if active else "删除课程库记录；已导出的笔记文件会保留"
+        )
         recoverable = False
         editable = False
         if valid:
             row = self.rows[index]
-            editable = int(row["segment_count"]) > 0 and str(row["status"]) not in {
-                "recording", "transcribing", "translating", "organizing"
-            }
-            recoverable = int(row["segment_count"]) > 0 and (
+            editable = int(row["segment_count"]) > 0 and not active
+            recoverable = not active and int(row["segment_count"]) > 0 and (
                 int(row["pending_count"]) > 0
                 or str(row["status"]) in {"needs_attention", "interrupted", "failed"}
             )
@@ -2970,14 +3090,28 @@ class LibraryPage(Page):
         if not (0 <= index < len(self.rows)):
             return
         row = self.rows[index]
+        current = self.repository.get_course(str(row["id"]))
+        if current is None or str(current["status"]) in {
+            "recording", "transcribing", "translating", "organizing"
+        }:
+            self.reload(preferred_index=index)
+            show_message(
+                self, QMessageBox.Icon.Warning, "暂时不能删除",
+                "课堂仍在运行或收尾，请结束后再删除；如果已结束，请刷新课程库。",
+            )
+            return
         title = str(row["title"])
         count = int(row["segment_count"])
         if not confirm_course_delete(self, title, count):
             return
-        if self.repository.delete_course(str(row["id"])):
+        if self.repository.delete_course_if_inactive(str(row["id"])):
             self.reload(preferred_index=index)
         else:
-            show_message(self, QMessageBox.Icon.Warning, "记录不存在", "这条课程记录可能已经被删除，请刷新后重试。")
+            self.reload(preferred_index=index)
+            show_message(
+                self, QMessageBox.Icon.Warning, "删除未执行",
+                "课程状态已变化或记录已删除，请刷新后重试；正在运行的课堂不会被删除。",
+            )
 
     def edit_selected(self) -> None:
         index = self.list.currentRow()
@@ -2998,6 +3132,16 @@ class LibraryPage(Page):
             return
         row = self.rows[index]
         course_id = str(row["id"])
+        current = self.repository.get_course(course_id)
+        if current is None or str(current["status"]) in {
+            "recording", "transcribing", "translating", "organizing"
+        }:
+            self.reload(preferred_index=index)
+            show_message(
+                self, QMessageBox.Icon.Warning, "暂时不能补译",
+                "课堂仍在运行或收尾，请结束后再补译；如果已结束，请刷新课程库。",
+            )
+            return
         export_only = not int(row["pending_count"]) and bool(row["notes_draft_ready"])
         if not confirm_course_recovery(
             self, str(row["title"]), int(row["pending_count"]),
